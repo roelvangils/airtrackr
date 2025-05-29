@@ -1,0 +1,92 @@
+{
+    "app": {
+        "update_interval_seconds": 60,
+        "enable_continuous_monitoring": true,
+        "max_retry_attempts": 3,
+        "retry_delay_seconds": 5
+    },
+    "screenshots": {
+        "quality": "high",
+        "retain_days": 30,
+        "max_storage_mb": 500,
+        "auto_cleanup": true,
+        "save_debug_regions": false
+    },
+    "findmy": {
+        "app_name": "FindMy",
+        "window_detection_timeout": 10,
+        "ensure_app_active": true,
+        "activation_delay_seconds": 0.5
+    },
+    "locations": {
+        "custom_coordinates": {
+            "home": {
+                "latitude": "51,05582",
+                "longitude": "3,72538",
+                "note": "Replace null values with your home coordinates"
+            },
+            "office": {
+                "latitude": "51,05582",
+                "longitude": "3,72538",
+                "note": "Replace null values with your office coordinates"
+            }
+        }
+    },
+    "geocoding": {
+        "provider": "nominatim",
+        "rate_limit_seconds": 1.1,
+        "timeout_seconds": 10,
+        "user_agent": "AirTracker/1.0 (https://github.com/user/airtracker)",
+        "fallback_enabled": true,
+        "cache_results": true,
+        "cache_duration_days": 7
+    },
+    "ocr": {
+        "engine": "tesseract",
+        "language": "eng",
+        "confidence_threshold": 30,
+        "preprocessing": {
+            "enhance_contrast": true,
+            "noise_reduction": true,
+            "upscale_factor": 2
+        }
+    },
+    "database": {
+        "backup_enabled": true,
+        "backup_interval_hours": 24,
+        "cleanup_enabled": true,
+        "cleanup_old_data_days": 90,
+        "vacuum_interval_days": 7,
+        "max_size_mb": 100
+    },
+    "logging": {
+        "level": "INFO",
+        "console_output": true,
+        "file_output": true,
+        "log_file": "logs/airtracker.log",
+        "max_log_size_mb": 10,
+        "backup_count": 5,
+        "include_timestamps": true
+    },
+    "notifications": {
+        "enabled": false,
+        "location_change_alerts": false,
+        "low_battery_alerts": false,
+        "error_alerts": true,
+        "notification_methods": ["console"]
+    },
+    "advanced": {
+        "fuzzy_matching_threshold": 80,
+        "location_text_cleaning": true,
+        "duplicate_detection": true,
+        "region_extraction_coords": {
+            "note": "Auto-detected coordinates for AirTag regions in Find My app",
+            "regions": []
+        },
+        "performance": {
+            "parallel_processing": false,
+            "memory_limit_mb": 256,
+            "max_concurrent_geocoding": 1
+        }
+    }
+}

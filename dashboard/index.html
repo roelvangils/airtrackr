@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AirTracker Dashboard</title>
+    <link rel="stylesheet" href="/src/styles/main.scss">
+</head>
+<body>
+    <div id="app">
+        <header class="header">
+            <div class="header-content">
+                <h1>􁄿 AirTracker Dashboard</h1>
+                <div class="search-container" id="search-container" style="display: none;">
+                    <div class="search-field">
+                        <span class="search-icon">􀊫</span>
+                        <input type="text" id="device-search" placeholder="Search AirTags..." autocomplete="off" spellcheck="false">
+                        <button class="clear-search" id="clear-search" style="display: none;">􀁡</button>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <main class="main" id="main-content">
+            <!-- Content will be dynamically loaded here -->
+        </main>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+</body>
+</html>
