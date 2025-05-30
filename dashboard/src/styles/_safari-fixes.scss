@@ -1,0 +1,102 @@
+// Safari-specific fixes for CSS custom properties
+// Import this after main styles to ensure proper dark mode support
+
+// Ensure text colors work properly in Safari
+.header,
+.device-card,
+.timeline-container,
+.timeline-item,
+.loading,
+.error {
+  color: var(--label-primary);
+}
+
+.device-name,
+.timeline-location,
+h1, h2, h3, h4, h5, h6 {
+  color: var(--label-primary);
+}
+
+.meta-label,
+.device-meta,
+.timeline-meta,
+.timeline-duration,
+.timeline-distance {
+  color: var(--label-secondary);
+}
+
+.timeline-time,
+.timeline-entry-count {
+  color: var(--label-tertiary);
+}
+
+// Ensure backgrounds work properly
+.device-card {
+  background-color: var(--secondary-system-grouped-background);
+  border-color: var(--separator);
+}
+
+.timeline-item .timeline-content {
+  background-color: var(--secondary-system-grouped-background);
+  border-color: var(--separator);
+}
+
+// Button fixes
+.view-history-btn,
+.back-btn {
+  color: var(--primary-blue);
+  
+  &:hover {
+    opacity: 0.7;
+  }
+}
+
+.danger-btn {
+  color: #FF3B30;
+}
+
+// Dark mode specific fixes for Safari
+@media (prefers-color-scheme: dark) {
+  // Force white text on all primary elements
+  body,
+  .header,
+  .device-card,
+  .timeline-container,
+  .timeline-item {
+    color: #FFFFFF;
+  }
+  
+  .device-name,
+  .timeline-location,
+  h1, h2, h3, h4, h5, h6 {
+    color: #FFFFFF;
+  }
+  
+  .meta-label,
+  .device-meta,
+  .timeline-meta,
+  .timeline-duration {
+    color: rgba(235, 235, 245, 0.6);
+  }
+  
+  .timeline-time,
+  .timeline-entry-count {
+    color: rgba(235, 235, 245, 0.3);
+  }
+  
+  // Ensure backgrounds are dark
+  body {
+    background-color: #000000;
+  }
+  
+  .device-card,
+  .timeline-item .timeline-content {
+    background-color: #1C1C1E;
+    border-color: rgba(84, 84, 88, 0.6);
+  }
+  
+  .header {
+    background: rgba(28, 28, 30, 0.72);
+    border-bottom-color: rgba(84, 84, 88, 0.6);
+  }
+}
