@@ -1,13 +1,36 @@
 @use 'sass:color';
 
-// Apple-inspired design system variables
+// CSS Custom Properties for theme support
+:root {
+  // Colors that adapt to light/dark mode
+  --primary-blue: #007AFF;
+  --primary-gray: #8E8E93;
+  --label-primary: #000000;
+  --label-secondary: #3C3C43;
+  --label-tertiary: rgba(60, 60, 67, 0.6);
+  --label-quaternary: rgba(60, 60, 67, 0.18);
+  --separator: rgba(60, 60, 67, 0.29);
+  --opaque-separator: #C6C6C8;
+  --system-background: #FFFFFF;
+  --secondary-system-background: #F2F2F7;
+  --tertiary-system-background: #FFFFFF;
+  --system-grouped-background: #F2F2F7;
+  --secondary-system-grouped-background: #FFFFFF;
+  --tertiary-system-grouped-background: #F2F2F7;
+  --system-fill: rgba(120, 120, 128, 0.2);
+  --secondary-system-fill: rgba(120, 120, 128, 0.16);
+  --tertiary-system-fill: rgba(118, 118, 128, 0.12);
+  --quaternary-system-fill: rgba(116, 116, 128, 0.08);
+}
+
+// Sass variables - using default light mode values
 $primary-blue: #007AFF;
 $primary-gray: #8E8E93;
 $label-primary: #000000;
 $label-secondary: #3C3C43;
-$label-tertiary: #3C3C4399;
-$label-quaternary: #3C3C4326;
-$separator: #3C3C434A;
+$label-tertiary: rgba(60, 60, 67, 0.6);
+$label-quaternary: rgba(60, 60, 67, 0.18);
+$separator: rgba(60, 60, 67, 0.29);
 $opaque-separator: #C6C6C8;
 $system-background: #FFFFFF;
 $secondary-system-background: #F2F2F7;
@@ -15,10 +38,10 @@ $tertiary-system-background: #FFFFFF;
 $system-grouped-background: #F2F2F7;
 $secondary-system-grouped-background: #FFFFFF;
 $tertiary-system-grouped-background: #F2F2F7;
-$system-fill: #78788033;
-$secondary-system-fill: #78788028;
-$tertiary-system-fill: #7676801E;
-$quaternary-system-fill: #74748014;
+$system-fill: rgba(120, 120, 128, 0.2);
+$secondary-system-fill: rgba(120, 120, 128, 0.16);
+$tertiary-system-fill: rgba(118, 118, 128, 0.12);
+$quaternary-system-fill: rgba(116, 116, 128, 0.08);
 
 // SF Pro font stack
 $sf-font-stack: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
@@ -96,8 +119,8 @@ html {
 
 body {
   font-family: $sf-font-stack;
-  background-color: $system-grouped-background;
-  color: $label-primary;
+  background-color: var(--system-grouped-background);
+  color: var(--label-primary);
   line-height: 1.47059;
   letter-spacing: -0.022em;
 }
@@ -959,16 +982,24 @@ body {
 // Dark mode support
 @media (prefers-color-scheme: dark) {
   :root {
+    --primary-blue: #0A84FF;
+    --primary-gray: #98989D;
     --label-primary: #FFFFFF;
-    --label-secondary: #EBEBF599;
-    --label-tertiary: #EBEBF54C;
-    --separator: #54545899;
+    --label-secondary: rgba(235, 235, 245, 0.6);
+    --label-tertiary: rgba(235, 235, 245, 0.3);
+    --label-quaternary: rgba(235, 235, 245, 0.18);
+    --separator: rgba(84, 84, 88, 0.6);
+    --opaque-separator: #38383A;
     --system-background: #000000;
     --secondary-system-background: #1C1C1E;
     --tertiary-system-background: #2C2C2E;
     --system-grouped-background: #000000;
     --secondary-system-grouped-background: #1C1C1E;
     --tertiary-system-grouped-background: #2C2C2E;
+    --system-fill: rgba(120, 120, 128, 0.36);
+    --secondary-system-fill: rgba(120, 120, 128, 0.32);
+    --tertiary-system-fill: rgba(118, 118, 128, 0.24);
+    --quaternary-system-fill: rgba(118, 118, 128, 0.18);
   }
   
   body {
@@ -995,3 +1026,6 @@ body {
     border-color: var(--separator);
   }
 }
+
+// Import Safari fixes at the end to ensure they override other styles
+@import 'safari-fixes';
