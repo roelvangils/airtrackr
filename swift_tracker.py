@@ -61,19 +61,15 @@ class SwiftAirTagTracker:
         # Ensure database directory exists
         Path(db_path).parent.mkdir(exist_ok=True)
         
-        # Verify Swift extractor exists
+        # Verify Swift extractor exists or compile it
         if not self.swift_extractor.exists():
-            error_msg = f"""
-⚠️  Swift extractor not found at {self.swift_extractor}
-
-Please compile it first:
-  cd swift && swiftc airtag_extractor.swift -o airtag_extractor
-
-Or run:
-  make swift-extractor
-"""
-            logger.error(error_msg)
-            raise FileNotFoundError("Swift extractor not compiled")
+            logger.warning(f"Swift extractor not found at {self.swift_extractor}")
+            self._compile_swift_extractor()
+        else:
+            # Check if the binary works on this architecture
+            if not self._test_swift_extractor():
+                logger.warning("Swift extractor incompatible with current architecture, recompiling...")
+                self._compile_swift_extractor()
         
         # Make sure extractor is executable
         self.swift_extractor.chmod(0o755)
@@ -149,6 +145,71 @@ Or run:
             
             conn.commit()
             logger.debug("Database schema initialized")
+    
+    def _test_swift_extractor(self) -> bool:
+        """
+        Test if the Swift extractor binary works on current architecture.
+        
+        Returns:
+            True if binary works, False if incompatible
+        """
+        try:
+            # Try to run with --help or minimal test
+            result = subprocess.run(
+                [str(self.swift_extractor), "--version"],
+                capture_output=True,
+                timeout=2
+            )
+            # If it doesn't crash, it's compatible
+            return result.returncode != 86  # 86 = Bad CPU type
+        except Exception:
+            return False
+    
+    def _compile_swift_extractor(self):
+        """
+        Compile the Swift extractor for the current architecture or as universal binary.
+        """
+        swift_dir = self.swift_extractor.parent
+        swift_source = swift_dir / "airtag_extractor.swift"
+        build_script = swift_dir / "build_universal.sh"
+        
+        if not swift_source.exists():
+            raise FileNotFoundError(f"Swift source not found at {swift_source}")
+        
+        logger.info("Compiling Swift extractor...")
+        
+        # Check if universal build script exists
+        if build_script.exists():
+            logger.info("Using universal build script...")
+            try:
+                result = subprocess.run(
+                    ["bash", str(build_script)],
+                    cwd=swift_dir,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                logger.info("Successfully compiled universal binary")
+                return
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"Universal build failed: {e.stderr}")
+                # Fall back to simple compilation
+        
+        # Simple compilation for current architecture
+        logger.info("Compiling for current architecture...")
+        try:
+            result = subprocess.run(
+                ["swiftc", str(swift_source), "-o", str(self.swift_extractor)],
+                cwd=swift_dir,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            logger.info("Successfully compiled Swift extractor")
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Failed to compile Swift extractor: {e.stderr}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
     
     @contextmanager
     def _get_db_connection(self):
