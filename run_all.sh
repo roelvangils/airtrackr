@@ -74,13 +74,25 @@ cd dashboard && bun run dev &
 DASHBOARD_PID=$!
 echo -e "   Dashboard started (PID: $DASHBOARD_PID)"
 
+# Get local IP address
+LOCAL_IP=$(ipconfig getifaddr en0 || ipconfig getifaddr en1 || echo "unknown")
+
 echo -e "\n${GREEN}All services are running!${NC}"
 echo "================================"
 echo "Swift Tracker: Running (updates every 2 minutes)"
-echo "API: http://localhost:8001"
-echo "API Docs: http://localhost:8001/docs"
-echo "Dashboard: http://localhost:5173"
 echo ""
+echo "Local Access:"
+echo "  API: http://localhost:8001"
+echo "  API Docs: http://localhost:8001/docs"
+echo "  Dashboard: http://localhost:5173"
+echo ""
+if [ "$LOCAL_IP" != "unknown" ]; then
+    echo "Network Access (for other devices on your network):"
+    echo "  API: http://${LOCAL_IP}:8001"
+    echo "  API Docs: http://${LOCAL_IP}:8001/docs"
+    echo "  Dashboard: http://${LOCAL_IP}:5173"
+    echo ""
+fi
 echo -e "${YELLOW}Press Ctrl+C to stop all services${NC}"
 
 # Wait for all background processes

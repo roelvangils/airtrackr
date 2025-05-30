@@ -1,6 +1,17 @@
 export class ApiService {
     constructor() {
-        this.baseUrl = 'http://localhost:8001';
+        // Dynamically determine API URL based on current location
+        // If accessing from localhost, use localhost
+        // If accessing from network, use the same hostname
+        const hostname = window.location.hostname;
+        const isLocalhost = hostname === 'localhost' || hostname === '127.0.0.1';
+        
+        // Use the same hostname as the dashboard, but with API port
+        this.baseUrl = isLocalhost 
+            ? 'http://localhost:8001'
+            : `http://${hostname}:8001`;
+            
+        console.log('API endpoint:', this.baseUrl);
     }
     
     async request(endpoint, options = {}) {
