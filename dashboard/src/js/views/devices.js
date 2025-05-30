@@ -23,11 +23,15 @@ export class DevicesView {
     }
     
     renderDeviceCard(device) {
-        const deviceId = device.id || device.device_id;
-        const deviceName = device.name || device.device_name;
-        const lastSeen = device.last_seen ? new Date(device.last_seen).toLocaleString() : 'Never';
+        const deviceId = device.device_name; // Swift API uses device_name as identifier
+        const deviceName = device.device_name;
+        // Parse timestamps - API returns UTC without timezone suffix, need to append 'Z'
+        const lastSeenDate = device.last_seen ? new Date(device.last_seen + 'Z') : null;
+        const firstSeenDate = device.first_seen ? new Date(device.first_seen + 'Z') : null;
+        
+        const lastSeen = lastSeenDate ? lastSeenDate.toLocaleString() : 'Never';
         const locationCount = device.location_count || 0;
-        const firstSeen = device.first_seen ? new Date(device.first_seen).toLocaleString() : 'Unknown';
+        const firstSeen = firstSeenDate ? firstSeenDate.toLocaleString() : 'Unknown';
         
         return `
             <div class="device-card">
@@ -69,7 +73,7 @@ export class DevicesView {
                                 </div>
                             ` : ''}
                         </div>
-                        <button class="view-history-btn" data-route="/device/${deviceId}">
+                        <button class="view-history-btn" data-route="/device/${encodeURIComponent(deviceId)}">
                             View Location History
                         </button>
                     </div>
@@ -136,7 +140,7 @@ export class DevicesView {
     }
     
     async calculateDeviceDistance(device) {
-        const deviceId = device.id || device.device_id;
+        const deviceId = device.device_name;
         
         try {
             // Get the latest location for this device

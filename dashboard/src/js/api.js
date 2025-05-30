@@ -1,6 +1,6 @@
 export class ApiService {
     constructor() {
-        this.baseUrl = 'http://localhost:8000';
+        this.baseUrl = 'http://localhost:8001';
     }
     
     async request(endpoint, options = {}) {
@@ -38,12 +38,12 @@ export class ApiService {
         return this.request('/devices');
     }
     
-    async getDevice(deviceId) {
-        return this.request(`/devices/${deviceId}`);
+    async getDevice(deviceName) {
+        return this.request(`/devices/${encodeURIComponent(deviceName)}`);
     }
     
-    async getDeviceLocations(deviceId, limit = 50) {
-        return this.request(`/devices/${deviceId}/locations?limit=${limit}`);
+    async getDeviceLocations(deviceName, limit = 50) {
+        return this.request(`/devices/${encodeURIComponent(deviceName)}/history?limit=${limit}`);
     }
     
     async getLocations(limit = 100) {

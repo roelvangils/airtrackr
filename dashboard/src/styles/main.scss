@@ -1,3 +1,5 @@
+@use 'sass:color';
+
 // Apple-inspired design system variables
 $primary-blue: #007AFF;
 $primary-gray: #8E8E93;
@@ -365,7 +367,7 @@ body {
   letter-spacing: -0.43px;
   
   &:hover {
-    background-color: darken($primary-blue, 8%);
+    background-color: color.adjust($primary-blue, $lightness: -8%);
     transform: translateY(-1px);
     box-shadow: $shadow-md;
   }
@@ -591,7 +593,7 @@ body {
   }
   
   &::before {
-    background: linear-gradient(135deg, $primary-blue 0%, lighten($primary-blue, 20%) 100%);
+    background: linear-gradient(135deg, $primary-blue 0%, color.adjust($primary-blue, $lightness: 20%) 100%);
     width: 20px;
     height: 20px;
     left: 6px;
@@ -614,7 +616,7 @@ body {
   font-family: $sf-font-stack;
   
   &:hover {
-    background-color: darken(#FF3B30, 8%);
+    background-color: color.adjust(#FF3B30, $lightness: -8%);
     transform: translateY(-1px);
     box-shadow: $shadow-md;
   }
@@ -697,7 +699,7 @@ body {
       white-space: nowrap;
       
       &:hover {
-        background-color: darken(#FF3B30, 8%);
+        background-color: color.adjust(#FF3B30, $lightness: -8%);
         transform: translateY(-1px);
         box-shadow: $shadow-md;
       }
@@ -814,7 +816,7 @@ body {
           color: white;
           
           &:hover:not(:disabled) {
-            background-color: darken(#FF3B30, 8%);
+            background-color: color.adjust(#FF3B30, $lightness: -8%);
           }
           
           &:disabled {

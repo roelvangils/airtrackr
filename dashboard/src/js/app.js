@@ -39,9 +39,12 @@ class App {
             // Hide search container on detail view
             this.hideSearchField();
             
+            // Decode the device name from the URL parameter
+            const deviceName = decodeURIComponent(deviceId);
+            
             const [device, locations] = await Promise.all([
-                this.apiService.getDevice(deviceId),
-                this.apiService.getDeviceLocations(deviceId)
+                this.apiService.getDevice(deviceName),
+                this.apiService.getDeviceLocations(deviceName)
             ]);
             
             const detailView = new DeviceDetailView(device, locations.locations, this.router, this.apiService);

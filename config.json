@@ -20,9 +20,9 @@
     },
     "locations": {
         "custom_coordinates": {
-            "home": {
-                "latitude": "51,05582",
-                "longitude": "3,72538",
+            "Home": {
+                "latitude": "51,055763244628906",
+                "longitude": "3,725496292114258",
                 "note": "Replace null values with your home coordinates"
             },
             "office": {

@@ -58,7 +58,7 @@ export class DeviceDetailView {
         const groups = [];
         let currentGroup = {
             locations: [locations[0]],
-            cleanLocation: this.processLocationText(locations[0].location_text),
+            cleanLocation: this.processLocationText(locations[0].location || locations[0].location_text),
             startTime: new Date(locations[0].timestamp),
             endTime: new Date(locations[0].timestamp),
             coordinates: {
@@ -70,7 +70,7 @@ export class DeviceDetailView {
         
         for (let i = 1; i < locations.length; i++) {
             const current = locations[i];
-            const currentCleanLocation = this.processLocationText(current.location_text);
+            const currentCleanLocation = this.processLocationText(current.location || current.location_text);
             
             // Check if this location should be grouped with the previous one
             if (this.shouldGroupLocations(currentGroup.cleanLocation, currentCleanLocation)) {
@@ -228,7 +228,7 @@ export class DeviceDetailView {
         const fullDate = date.toLocaleString();
         
         // Process location text to filter out invalid entries and clean up formatting
-        const cleanLocation = this.processLocationText(location.location_text);
+        const cleanLocation = this.processLocationText(location.location || location.location_text);
         
         return `
             <div class="timeline-item">
@@ -272,22 +272,28 @@ export class DeviceDetailView {
             return 'Location not available';
         }
         
+        // Handle Swift tracker format: "Location, Time ago" or "Location, Paused"
+        // Remove time information from the end of the location string
+        let cleaned = locationText.trim();
+        
+        // Remove time suffixes like ", 15 min ago" or ", Paused"
+        cleaned = cleaned.replace(/,\s*\d+\s*(min|hr|hour|minute)s?\s*ago$/i, '');
+        cleaned = cleaned.replace(/,\s*(Paused|paused)$/i, '');
+        
         // Filter out invalid location patterns
         const invalidPatterns = [
             /^lastseen\d+\w*ago$/i,  // Matches "Lastseen1hrago", "Lastseen2hrago", etc.
             /^last\s*seen/i,         // Matches "last seen" variations
             /^seen\s*\d+/i,          // Matches "seen 1hr ago" variations
-            /^\d+\s*(hr|min|hour|minute)s?\s*ago$/i // Time ago patterns
+            /^\d+\s*(hr|min|hour|minute)s?\s*ago$/i, // Time ago patterns only
+            /^No location found$/i    // Swift tracker "No location found"
         ];
         
         for (const pattern of invalidPatterns) {
-            if (pattern.test(locationText.trim())) {
+            if (pattern.test(cleaned)) {
                 return 'Location not available';
             }
         }
-        
-        // Clean up and format addresses
-        let cleaned = locationText.trim();
         
         // Remove trailing characters like "-1", "-", ".", ":"
         cleaned = cleaned.replace(/[-:.]\d*$/, '');

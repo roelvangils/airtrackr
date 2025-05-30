@@ -1,0 +1,7 @@
+2025-05-29 21:40:43,239 - root - INFO - Database initialized with enhanced schema
+2025-05-29 21:40:43,239 - root - INFO - Enhanced AirTracker started - capturing every minute
+2025-05-29 21:40:43,239 - root - INFO - Press Ctrl+C to stop
+2025-05-29 21:40:43,239 - root - INFO - Starting capture cycle...
+2025-05-29 21:40:44,343 - root - ERROR - Could not find Find My window
+2025-05-29 21:40:44,344 - root - INFO - Capture cycle complete
+2025-05-29 21:40:48,240 - root - INFO - Received signal 2, shutting down...
