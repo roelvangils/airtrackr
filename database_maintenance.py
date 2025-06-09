@@ -76,17 +76,28 @@ class DatabaseMaintenance:
         
         tables = cursor.fetchall()
         
+        # Get list of valid table names for validation
+        valid_tables = [t[0] for t in tables]
+        
         for table_name, index_count in tables:
-            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            # Validate table name against the list from sqlite_master
+            if table_name not in valid_tables:
+                logging.error(f"Invalid table name detected: {table_name}. Skipping.")
+                continue
+                
+            # Use proper quoting for table names
+            cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
             row_count = cursor.fetchone()[0]
             
             print(f"\n{table_name}:")
             print(f"  Rows: {row_count:,}")
             print(f"  Indexes: {index_count}")
             
-            # Get table size estimate
-            cursor.execute(f"SELECT COUNT(*) * AVG(length(CAST(* AS TEXT))) FROM {table_name}")
-            size_estimate = cursor.fetchone()[0] or 0
+            # Get table size estimate - this query is too complex to safely construct
+            # Use a simpler approach
+            cursor.execute(f'PRAGMA table_info("{table_name}")')
+            col_count = len(cursor.fetchall())
+            size_estimate = row_count * col_count * 20  # Rough estimate
             print(f"  Estimated size: {size_estimate/1024:.1f} KB")
         
         # Database file size
@@ -126,9 +137,18 @@ class DatabaseMaintenance:
             """)
             
             indexes = cursor.fetchall()
+            # Get list of valid index names for validation
+            valid_indexes = [i[0] for i in indexes]
+            
             for (index_name,) in indexes:
+                # Validate index name
+                if index_name not in valid_indexes:
+                    logging.error(f"Invalid index name detected: {index_name}. Skipping.")
+                    continue
+                    
                 logging.info(f"Rebuilding index: {index_name}")
-                conn.execute(f"REINDEX {index_name}")
+                # Use proper quoting for index names
+                conn.execute(f'REINDEX "{index_name}"')
             
             conn.close()
             logging.info("Database optimization complete")

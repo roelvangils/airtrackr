@@ -40,15 +40,19 @@ def cleanup_database():
     cursor.execute("SELECT id, device_name FROM devices")
     devices = cursor.fetchall()
     
-    invalid_count = 0
+    invalid_ids = []
     for device_id, name in devices:
         if not is_valid_device_name(name):
             print(f"   Removing invalid device: '{name}' (ID: {device_id})")
-            cursor.execute("DELETE FROM device_locations WHERE device_id = ?", (device_id,))
-            cursor.execute("DELETE FROM devices WHERE id = ?", (device_id,))
-            invalid_count += 1
+            invalid_ids.append(device_id)
     
-    print(f"   Removed {invalid_count} invalid devices")
+    if invalid_ids:
+        placeholders = ','.join('?' * len(invalid_ids))
+        cursor.execute(f"DELETE FROM device_locations WHERE device_id IN ({placeholders})", invalid_ids)
+        cursor.execute(f"DELETE FROM devices WHERE id IN ({placeholders})", invalid_ids)
+        print(f"   Removed {len(invalid_ids)} invalid devices")
+    else:
+        print("   No invalid devices found")
     
     # 2. Consolidate Jelliede Bellie entries
     print("\n2. Consolidating 'Jelliede Bellie' entries...")

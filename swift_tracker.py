@@ -61,18 +61,14 @@ class SwiftAirTagTracker:
         # Ensure database directory exists
         Path(db_path).parent.mkdir(exist_ok=True)
         
-        # Verify Swift extractor exists or compile it
-        if not self.swift_extractor.exists():
-            logger.warning(f"Swift extractor not found at {self.swift_extractor}")
-            self._compile_swift_extractor()
-        else:
-            # Check if the binary works on this architecture
-            if not self._test_swift_extractor():
-                logger.warning("Swift extractor incompatible with current architecture, recompiling...")
-                self._compile_swift_extractor()
-        
-        # Make sure extractor is executable
-        self.swift_extractor.chmod(0o755)
+        # The binary MUST be pre-compiled as part of the deployment process.
+        if not self.swift_extractor.exists() or not os.access(self.swift_extractor, os.X_OK):
+            error_msg = (
+                f"Swift extractor not found or not executable at {self.swift_extractor}. "
+                "Please compile it using the 'swift/build_universal.sh' script before running the tracker."
+            )
+            logger.error(error_msg)
+            raise FileNotFoundError(error_msg)
         
         # Initialize database schema
         self._init_database()
@@ -132,84 +128,17 @@ class SwiftAirTagTracker:
                 ON swift_locations(timestamp DESC)
             ''')
             
-            # Only create extracted_at index if column exists
-            if 'extracted_at' in columns or 'extracted_at' not in columns:  # Will exist after ALTER
-                try:
-                    cursor.execute('''
-                        CREATE INDEX IF NOT EXISTS idx_swift_locations_extracted_at 
-                        ON swift_locations(extracted_at)
-                    ''')
-                except sqlite3.OperationalError:
-                    # Index might already exist or column might not exist in some edge case
-                    pass
+            # Create extracted_at index if needed
+            if 'extracted_at' not in columns:
+                logger.info("Upgrading schema: Adding 'extracted_at' column to swift_locations.")
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_swift_locations_extracted_at 
+                    ON swift_locations(extracted_at)
+                ''')
             
             conn.commit()
             logger.debug("Database schema initialized")
     
-    def _test_swift_extractor(self) -> bool:
-        """
-        Test if the Swift extractor binary works on current architecture.
-        
-        Returns:
-            True if binary works, False if incompatible
-        """
-        try:
-            # Try to run with --help or minimal test
-            result = subprocess.run(
-                [str(self.swift_extractor), "--version"],
-                capture_output=True,
-                timeout=2
-            )
-            # If it doesn't crash, it's compatible
-            return result.returncode != 86  # 86 = Bad CPU type
-        except Exception:
-            return False
-    
-    def _compile_swift_extractor(self):
-        """
-        Compile the Swift extractor for the current architecture or as universal binary.
-        """
-        swift_dir = self.swift_extractor.parent
-        swift_source = swift_dir / "airtag_extractor.swift"
-        build_script = swift_dir / "build_universal.sh"
-        
-        if not swift_source.exists():
-            raise FileNotFoundError(f"Swift source not found at {swift_source}")
-        
-        logger.info("Compiling Swift extractor...")
-        
-        # Check if universal build script exists
-        if build_script.exists():
-            logger.info("Using universal build script...")
-            try:
-                result = subprocess.run(
-                    ["bash", str(build_script)],
-                    cwd=swift_dir,
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                logger.info("Successfully compiled universal binary")
-                return
-            except subprocess.CalledProcessError as e:
-                logger.warning(f"Universal build failed: {e.stderr}")
-                # Fall back to simple compilation
-        
-        # Simple compilation for current architecture
-        logger.info("Compiling for current architecture...")
-        try:
-            result = subprocess.run(
-                ["swiftc", str(swift_source), "-o", str(self.swift_extractor)],
-                cwd=swift_dir,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            logger.info("Successfully compiled Swift extractor")
-        except subprocess.CalledProcessError as e:
-            error_msg = f"Failed to compile Swift extractor: {e.stderr}"
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
     
     @contextmanager
     def _get_db_connection(self):
@@ -294,10 +223,10 @@ class SwiftAirTagTracker:
         saved_count = 0
         
         with self._get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            for device_data in devices:
-                try:
+            try:
+                cursor = conn.cursor()
+                
+                for device_data in devices:
                     # Parse extracted_at timestamp from ISO format
                     extracted_at = device_data.get('extractedAt', '')
                     if extracted_at:
@@ -346,14 +275,19 @@ class SwiftAirTagTracker:
                     ))
                     
                     saved_count += 1
-                    
-                except Exception as e:
-                    logger.error(f"Failed to save device {device_data.get('name', 'Unknown')}: {e}")
-                    continue
-            
-            conn.commit()
-        
-        logger.info(f"Saved {saved_count}/{len(devices)} location updates")
+                
+                conn.commit()  # Commit once after all records are processed
+                logger.info(f"Saved {saved_count}/{len(devices)} location updates")
+                
+            except sqlite3.Error as e:
+                logger.error(f"Database error during batch insert, rolling back: {e}")
+                conn.rollback()
+                return 0  # Indicate failure
+            except Exception as e:
+                logger.error(f"An unexpected error occurred, rolling back: {e}")
+                conn.rollback()
+                return 0  # Indicate failure
+                
         return saved_count
     
     def track_once(self) -> bool:

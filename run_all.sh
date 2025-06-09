@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # AirTracker - Run All Services
 # This script starts all components of the AirTracker system:

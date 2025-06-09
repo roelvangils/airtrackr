@@ -17,6 +17,15 @@ class ImprovedAirTracker:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        # Create screenshots table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS screenshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL UNIQUE,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         # Create devices table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS devices (
@@ -55,29 +64,25 @@ class ImprovedAirTracker:
     
     def get_or_create_device(self, device_name):
         """Get device ID, creating if necessary"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Try to get existing device
-        cursor.execute('SELECT id FROM devices WHERE device_name = ?', (device_name,))
-        result = cursor.fetchone()
-        
-        if result:
-            device_id = result[0]
-        else:
-            # Create new device
+        with sqlite3.connect(self.db_path) as conn:  # Use context manager
+            cursor = conn.cursor()
+            
+            # Use INSERT ... ON CONFLICT for an atomic operation
             device_type = self.guess_device_type(device_name)
             cursor.execute('''
                 INSERT INTO devices (device_name, device_type)
                 VALUES (?, ?)
+                ON CONFLICT(device_name) DO NOTHING
             ''', (device_name, device_type))
-            device_id = cursor.lastrowid
-            print(f"✓ New device registered: {device_name} (ID: {device_id})")
-        
-        conn.commit()
-        conn.close()
-        
-        return device_id
+            
+            # Now, reliably get the ID
+            cursor.execute('SELECT id FROM devices WHERE device_name = ?', (device_name,))
+            result = cursor.fetchone()
+            
+            if cursor.rowcount > 0 and cursor.lastrowid:
+                print(f"✓ New device registered: {device_name} (ID: {result[0]})")
+            
+            return result[0]
     
     def guess_device_type(self, device_name):
         """Guess device type from name"""
