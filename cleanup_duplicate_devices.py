@@ -54,6 +54,14 @@ def find_duplicate_groups():
     # Find duplicates
     duplicates = {k: v for k, v in device_groups.items() if len(v) > 1}
     
+    # Get all location counts in one query
+    cursor.execute("""
+        SELECT device_id, COUNT(*) 
+        FROM device_locations 
+        GROUP BY device_id
+    """)
+    location_counts = dict(cursor.fetchall())
+    
     print("DUPLICATE DEVICE GROUPS FOUND:")
     print("=" * 60)
     
@@ -61,9 +69,8 @@ def find_duplicate_groups():
         print(f"\nGroup: '{cleaned_name}'")
         print(f"  Count: {len(devices)} devices")
         for device in devices:
-            # Count locations for this device
-            cursor.execute("SELECT COUNT(*) FROM device_locations WHERE device_id = ?", (device['id'],))
-            location_count = cursor.fetchone()[0]
+            # Look up the count from the dictionary (default to 0 if no locations)
+            location_count = location_counts.get(device['id'], 0)
             print(f"  - ID {device['id']}: '{device['name']}' ({location_count} locations)")
     
     conn.close()
@@ -84,13 +91,23 @@ def consolidate_duplicates(dry_run=True):
         if not devices:
             continue
             
+        # Get all location counts in one query
+        device_ids = [d['id'] for d in devices]
+        placeholders = ','.join('?' * len(device_ids))
+        cursor.execute(f"""
+            SELECT device_id, COUNT(*) 
+            FROM device_locations 
+            WHERE device_id IN ({placeholders})
+            GROUP BY device_id
+        """, device_ids)
+        location_counts = dict(cursor.fetchall())
+        
         # Choose the primary device (the one with most locations or earliest first_seen)
         primary = None
         max_locations = -1
         
         for device in devices:
-            cursor.execute("SELECT COUNT(*) FROM device_locations WHERE device_id = ?", (device['id'],))
-            location_count = cursor.fetchone()[0]
+            location_count = location_counts.get(device['id'], 0)
             
             if location_count > max_locations or (location_count == max_locations and primary is None):
                 max_locations = location_count

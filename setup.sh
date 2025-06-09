@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # AirTracker Setup Script
 # This script ensures everything is ready to run AirTracker

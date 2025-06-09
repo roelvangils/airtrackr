@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Build Universal Binary for AirTag Extractor
 # This script compiles the Swift code for both Intel and Apple Silicon
