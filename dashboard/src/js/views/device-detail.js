@@ -301,7 +301,7 @@ export class DeviceDetailView {
         
         // Clean up common OCR artifacts
         cleaned = cleaned.replace(/\s+/g, ' '); // Multiple spaces to single space
-        cleaned = cleaned.replace(/[^\w\s,.-]/g, ''); // Remove unusual characters but keep punctuation
+        // Note: Don't strip Unicode characters - keep accented letters like ç, é, ñ, etc.
         
         // Format known location patterns
         if (cleaned.toLowerCase() === 'home') {
