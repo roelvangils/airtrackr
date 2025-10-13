@@ -45,10 +45,15 @@ export class ApiService {
         }
     }
     
-    async getDevices() {
-        return this.request('/devices');
+    async getDevices(deviceType = null) {
+        const url = deviceType ? `/devices?device_type=${deviceType}` : '/devices';
+        return this.request(url);
     }
-    
+
+    async getDeviceCounts() {
+        return this.request('/devices/counts');
+    }
+
     async getDevice(deviceName) {
         return this.request(`/devices/${encodeURIComponent(deviceName)}`);
     }
