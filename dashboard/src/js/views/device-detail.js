@@ -12,7 +12,7 @@ export class DeviceDetailView {
                 <button class="back-btn" data-route="/">
                     ← Back to Dashboard
                 </button>
-                
+
                 <div class="timeline-header">
                     <h2>${this.escapeHtml(this.device.name || this.device.device_name || 'Unknown Device')}</h2>
                     <div class="timeline-meta">
@@ -20,14 +20,76 @@ export class DeviceDetailView {
                         ${this.device.first_seen ? `• First seen ${new Date(this.device.first_seen).toLocaleDateString()}` : ''}
                     </div>
                 </div>
-                
+
+                ${this.renderMap()}
+
                 ${this.renderTimeline()}
-                
+
                 ${this.renderDangerZone()}
             </div>
         `;
     }
-    
+
+    renderMap() {
+        // Get the most recent location with coordinates
+        if (!this.locations || this.locations.length === 0) {
+            return '';
+        }
+
+        // Sort by timestamp to get the most recent
+        const sortedLocations = [...this.locations].sort((a, b) =>
+            new Date(b.timestamp) - new Date(a.timestamp)
+        );
+
+        // Find the first location with valid coordinates
+        const locationWithCoords = sortedLocations.find(loc =>
+            loc.latitude && loc.longitude
+        );
+
+        if (!locationWithCoords) {
+            return `
+                <div class="map-container">
+                    <div class="map-placeholder">
+                        <p>􀙯 No location coordinates available</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        const { latitude, longitude } = locationWithCoords;
+        const locationText = this.processLocationText(locationWithCoords.location || locationWithCoords.location_text);
+
+        // Apple Maps Embed API URL
+        const mapUrl = `https://embed.maps.apple.com/place?ll=${latitude},${longitude}&z=15&t=m`;
+
+        return `
+            <div class="map-container">
+                <div class="map-header">
+                    <h3>􀙯 Last Known Location</h3>
+                    <div class="map-location-name">${this.escapeHtml(locationText)}</div>
+                </div>
+                <div class="map-wrapper">
+                    <iframe
+                        class="apple-maps-embed"
+                        src="${mapUrl}"
+                        frameborder="0"
+                        allowfullscreen
+                        referrerpolicy="no-referrer-when-downgrade"
+                        loading="lazy">
+                    </iframe>
+                </div>
+                <div class="map-footer">
+                    <a href="https://maps.apple.com/?q=${latitude},${longitude}" target="_blank" class="map-link">
+                        􀙯 Open in Apple Maps
+                    </a>
+                    <a href="https://maps.google.com/maps?q=${latitude},${longitude}" target="_blank" class="map-link">
+                        􀋒 Open in Google Maps
+                    </a>
+                </div>
+            </div>
+        `;
+    }
+
     renderTimeline() {
         if (!this.locations || this.locations.length === 0) {
             return `
