@@ -307,10 +307,10 @@ export class DeviceDetailView {
         if (cleaned.toLowerCase() === 'home') {
             return 'Home';
         }
-        
-        // Capitalize first letter of each word for addresses
-        cleaned = cleaned.replace(/\b\w/g, l => l.toUpperCase());
-        
+
+        // Note: Don't auto-capitalize - breaks Unicode names like "François"
+        // Data already comes properly capitalized from the database
+
         return cleaned || 'Location not available';
     }
 
