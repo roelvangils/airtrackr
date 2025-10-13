@@ -8,37 +8,92 @@ class App {
         this.router = new Router();
         this.apiService = new ApiService();
         this.mainContent = document.getElementById('main-content');
-        
+        this.currentFilter = 'all';
+
         this.setupRoutes();
     }
-    
+
     setupRoutes() {
         this.router.addRoute('/', () => this.showDevicesView());
         this.router.addRoute('/device/:id', (params) => this.showDeviceDetail(params.id));
-        
+
         // Start routing
         this.router.start();
     }
-    
-    async showDevicesView() {
+
+    async showDevicesView(deviceType = null) {
         try {
-            // Show search container
+            // Show search container and filter tabs
             this.showSearchField();
-            
-            const devices = await this.apiService.getDevices();
+            this.showFilterTabs();
+
+            // Update counts
+            await this.updateFilterCounts();
+
+            // Fetch devices (optionally filtered by type)
+            const devices = await this.apiService.getDevices(deviceType);
             const devicesView = new DevicesView(devices, this.router, this.apiService);
             this.mainContent.innerHTML = devicesView.render();
             devicesView.bindEvents();
+
+            // Setup filter tab event listeners
+            this.bindFilterTabs();
         } catch (error) {
             this.showError('Failed to load devices: ' + error.message);
         }
     }
+
+    async updateFilterCounts() {
+        try {
+            const counts = await this.apiService.getDeviceCounts();
+
+            // Update count displays
+            const countAll = document.getElementById('count-all');
+            const countPeople = document.getElementById('count-people');
+            const countDevices = document.getElementById('count-devices');
+            const countItems = document.getElementById('count-items');
+
+            if (countAll) countAll.textContent = `(${counts.total})`;
+            if (countPeople) countPeople.textContent = `(${counts.people})`;
+            if (countDevices) countDevices.textContent = `(${counts.devices})`;
+            if (countItems) countItems.textContent = `(${counts.items})`;
+        } catch (error) {
+            console.error('Failed to update filter counts:', error);
+        }
+    }
+
+    bindFilterTabs() {
+        const filterTabs = document.querySelectorAll('.filter-tab');
+
+        filterTabs.forEach(tab => {
+            tab.addEventListener('click', (e) => {
+                const filter = tab.dataset.filter;
+                this.handleFilterChange(filter);
+            });
+        });
+    }
+
+    handleFilterChange(filter) {
+        // Update active state
+        document.querySelectorAll('.filter-tab').forEach(tab => {
+            tab.classList.remove('active');
+        });
+        document.querySelector(`.filter-tab[data-filter="${filter}"]`)?.classList.add('active');
+
+        // Store current filter
+        this.currentFilter = filter;
+
+        // Reload devices with filter
+        const deviceType = filter === 'all' ? null : filter;
+        this.showDevicesView(deviceType);
+    }
     
     async showDeviceDetail(deviceId) {
         try {
-            // Hide search container on detail view
+            // Hide search container and filter tabs on detail view
             this.hideSearchField();
-            
+            this.hideFilterTabs();
+
             // Decode the device name from the URL parameter
             const deviceName = decodeURIComponent(deviceId);
             
@@ -69,12 +124,12 @@ class App {
             searchContainer.style.display = 'flex';
         }
     }
-    
+
     hideSearchField() {
         const searchContainer = document.getElementById('search-container');
         if (searchContainer) {
             searchContainer.style.display = 'none';
-            
+
             // Clear search when hiding
             const searchInput = document.getElementById('device-search');
             const clearButton = document.getElementById('clear-search');
@@ -84,6 +139,20 @@ class App {
             if (clearButton) {
                 clearButton.style.display = 'none';
             }
+        }
+    }
+
+    showFilterTabs() {
+        const filterTabs = document.getElementById('filter-tabs');
+        if (filterTabs) {
+            filterTabs.style.display = 'flex';
+        }
+    }
+
+    hideFilterTabs() {
+        const filterTabs = document.getElementById('filter-tabs');
+        if (filterTabs) {
+            filterTabs.style.display = 'none';
         }
     }
 }

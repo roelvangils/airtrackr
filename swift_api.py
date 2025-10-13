@@ -45,18 +45,27 @@ class DeviceLocation(BaseModel):
     distance: Optional[str]
     latitude: Optional[float]
     longitude: Optional[float]
+    device_type: Optional[str] = None  # 'person', 'device', or 'item'
     timestamp: datetime
     extracted_at: Optional[datetime]
 
 class Device(BaseModel):
     """Device summary information"""
     device_name: str
+    device_type: Optional[str] = None  # 'person', 'device', or 'item'
     first_seen: datetime
     last_seen: datetime
     last_location: Optional[str]
     update_count: int
     minutes_since_update: Optional[float]
     location_count: Optional[int] = 0
+
+class DeviceTypeCounts(BaseModel):
+    """Count of devices by type"""
+    people: int
+    devices: int
+    items: int
+    total: int
 
 class DeviceHistory(BaseModel):
     """Device with location history"""
@@ -207,13 +216,17 @@ async def health_check():
         )
 
 @app.get("/devices", response_model=List[Device], tags=["Devices"])
-async def get_devices():
+async def get_devices(
+    device_type: Optional[str] = Query(None, description="Filter by device type: person, device, or item")
+):
     """Get all tracked devices with their current status"""
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT 
+
+        query = """
+            SELECT
                 d.device_name,
+                d.device_type,
                 d.first_seen,
                 d.last_seen,
                 d.last_location,
@@ -222,9 +235,19 @@ async def get_devices():
                 COUNT(l.id) as location_count
             FROM swift_devices d
             LEFT JOIN swift_locations l ON d.device_name = l.device_name
+        """
+
+        params = []
+        if device_type:
+            query += " WHERE d.device_type = ?"
+            params.append(device_type)
+
+        query += """
             GROUP BY d.device_name
             ORDER BY d.last_seen DESC
-        """)
+        """
+
+        cursor.execute(query, params)
         
         devices = []
         for row in cursor.fetchall():
@@ -236,14 +259,49 @@ async def get_devices():
         
         return devices
 
+@app.get("/devices/counts", response_model=DeviceTypeCounts, tags=["Devices"])
+async def get_device_counts():
+    """Get count of devices by type"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Count by type
+        cursor.execute("""
+            SELECT
+                device_type,
+                COUNT(*) as count
+            FROM swift_devices
+            WHERE device_type IS NOT NULL
+            GROUP BY device_type
+        """)
+
+        counts = {'people': 0, 'devices': 0, 'items': 0}
+        for row in cursor.fetchall():
+            device_type = row['device_type']
+            count = row['count']
+            if device_type == 'person':
+                counts['people'] = count
+            elif device_type == 'device':
+                counts['devices'] = count
+            elif device_type == 'item':
+                counts['items'] = count
+
+        return DeviceTypeCounts(
+            people=counts['people'],
+            devices=counts['devices'],
+            items=counts['items'],
+            total=counts['people'] + counts['devices'] + counts['items']
+        )
+
 @app.get("/devices/{device_name}", response_model=Device, tags=["Devices"])
 async def get_device(device_name: str = PathParam(..., description="Device name")):
     """Get specific device information"""
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT 
+            SELECT
                 device_name,
+                device_type,
                 first_seen,
                 last_seen,
                 last_location,
@@ -275,7 +333,7 @@ async def get_device_history(
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT 
+            SELECT
                 id,
                 device_name,
                 location,
@@ -283,6 +341,7 @@ async def get_device_history(
                 distance,
                 latitude,
                 longitude,
+                device_type,
                 timestamp,
                 extracted_at
             FROM swift_locations
@@ -307,12 +366,15 @@ async def get_latest_locations():
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT 
+            SELECT
                 l.id,
                 l.device_name,
                 l.location,
                 l.time_status,
                 l.distance,
+                l.latitude,
+                l.longitude,
+                l.device_type,
                 l.timestamp,
                 l.extracted_at
             FROM swift_locations l
@@ -320,7 +382,7 @@ async def get_latest_locations():
                 SELECT device_name, MAX(timestamp) as max_timestamp
                 FROM swift_locations
                 GROUP BY device_name
-            ) latest ON l.device_name = latest.device_name 
+            ) latest ON l.device_name = latest.device_name
                 AND l.timestamp = latest.max_timestamp
             ORDER BY l.device_name
         """)
@@ -465,4 +527,10 @@ async def trigger_tracking():
 # Run the server
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8001,
+        log_level="info",  # Enable detailed logging
+        access_log=True    # Log all API requests
+    )
