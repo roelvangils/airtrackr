@@ -59,9 +59,6 @@ export class DeviceDetailView {
         const { latitude, longitude } = locationWithCoords;
         const locationText = this.processLocationText(locationWithCoords.location || locationWithCoords.location_text);
 
-        // Apple Maps Embed API URL
-        const mapUrl = `https://embed.maps.apple.com/place?ll=${latitude},${longitude}&z=15&t=m`;
-
         return `
             <div class="map-container">
                 <div class="map-header">
@@ -69,14 +66,7 @@ export class DeviceDetailView {
                     <div class="map-location-name">${this.escapeHtml(locationText)}</div>
                 </div>
                 <div class="map-wrapper">
-                    <iframe
-                        class="apple-maps-embed"
-                        src="${mapUrl}"
-                        frameborder="0"
-                        allowfullscreen
-                        referrerpolicy="no-referrer-when-downgrade"
-                        loading="lazy">
-                    </iframe>
+                    <div id="map" class="apple-maps-embed" data-latitude="${latitude}" data-longitude="${longitude}" data-location="${this.escapeHtml(locationText)}"></div>
                 </div>
                 <div class="map-footer">
                     <a href="https://maps.apple.com/?q=${latitude},${longitude}" target="_blank" class="map-link">
@@ -385,8 +375,78 @@ export class DeviceDetailView {
             return `${(meters / 1000).toFixed(1)}km`;
         }
     }
-    
+
+    initializeMap() {
+        const mapElement = document.getElementById('map');
+        if (!mapElement) return;
+
+        const latitude = parseFloat(mapElement.dataset.latitude);
+        const longitude = parseFloat(mapElement.dataset.longitude);
+        const locationName = mapElement.dataset.location;
+
+        // Check if MapKit is available
+        if (typeof mapkit === 'undefined') {
+            console.warn('MapKit JS not loaded yet, will retry...');
+            // Retry after a short delay
+            setTimeout(() => this.initializeMap(), 500);
+            return;
+        }
+
+        try {
+            // Initialize MapKit with a demo token (user should replace this)
+            // To get your own token: https://developer.apple.com/maps/web/
+            mapkit.init({
+                authorizationCallback: (done) => {
+                    // Use anonymous token for demo purposes
+                    // IMPORTANT: Replace with your own MapKit JS token
+                    done('');
+                }
+            });
+
+            // Create map
+            const map = new mapkit.Map(mapElement, {
+                center: new mapkit.Coordinate(latitude, longitude),
+                zoom: 15,
+                mapType: mapkit.Map.MapTypes.Standard,
+                showsMapTypeControl: false,
+                showsZoomControl: true,
+                showsUserLocationControl: false,
+                showsPointsOfInterest: true,
+                showsScale: mapkit.FeatureVisibility.Adaptive
+            });
+
+            // Add annotation (pin)
+            const annotation = new mapkit.MarkerAnnotation(
+                new mapkit.Coordinate(latitude, longitude),
+                {
+                    color: '#007AFF',
+                    title: locationName,
+                    subtitle: `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`,
+                    glyphText: '📍'
+                }
+            );
+
+            map.addAnnotation(annotation);
+
+            // Store map instance for cleanup if needed
+            this.map = map;
+
+        } catch (error) {
+            console.error('Failed to initialize MapKit:', error);
+            // Show fallback message
+            mapElement.innerHTML = `
+                <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--label-tertiary); flex-direction: column; gap: 12px;">
+                    <p style="margin: 0;">􀙯 Map unavailable</p>
+                    <p style="margin: 0; font-size: 14px;">Configure MapKit JS token to enable maps</p>
+                </div>
+            `;
+        }
+    }
+
     bindEvents() {
+        // Initialize map if present
+        this.initializeMap();
+
         // Handle delete single location
         document.querySelectorAll('.delete-btn').forEach(btn => {
             btn.addEventListener('click', async (e) => {
