@@ -50,7 +50,7 @@ export class DeviceDetailView {
             return `
                 <div class="map-container">
                     <div class="map-placeholder">
-                        <p>📍 No location coordinates available</p>
+                        <p><i class="fa-solid fa-location-dot"></i> No location coordinates available</p>
                     </div>
                 </div>
             `;
@@ -62,7 +62,7 @@ export class DeviceDetailView {
         return `
             <div class="map-container">
                 <div class="map-header">
-                    <h3>📍 Last Known Location</h3>
+                    <h3><i class="fa-solid fa-location-dot"></i> Last Known Location</h3>
                     <div class="map-location-name">${this.escapeHtml(locationText)}</div>
                 </div>
                 <div class="map-wrapper">
@@ -76,10 +76,10 @@ export class DeviceDetailView {
                 </div>
                 <div class="map-footer">
                     <a href="https://maps.apple.com/?q=${latitude},${longitude}" target="_blank" class="map-link">
-                        🍎 Open in Apple Maps
+                        <i class="fa-solid fa-map"></i> Open in Apple Maps
                     </a>
                     <a href="https://maps.google.com/maps?q=${latitude},${longitude}" target="_blank" class="map-link">
-                        🌍 Open in Google Maps
+                        <i class="fa-solid fa-globe"></i> Open in Google Maps
                     </a>
                 </div>
             </div>
@@ -172,7 +172,7 @@ export class DeviceDetailView {
         return `
             <div class="danger-zone">
                 <div class="danger-zone-header">
-                    <h3>⚠️ Danger Zone</h3>
+                    <h3><i class="fa-solid fa-triangle-exclamation"></i> Danger Zone</h3>
                     <p>Irreversible and destructive actions</p>
                 </div>
                 <div class="danger-zone-content">
@@ -182,7 +182,7 @@ export class DeviceDetailView {
                             <p>Permanently remove "${this.escapeHtml(deviceName)}" and all its location history. This action cannot be undone.</p>
                         </div>
                         <button class="danger-btn delete-device-btn" data-device-id="${deviceId}" data-device-name="${this.escapeHtml(deviceName)}">
-                            🗑️ Delete Device
+                            <i class="fa-solid fa-trash-can"></i> Delete Device
                         </button>
                     </div>
                 </div>
@@ -225,10 +225,10 @@ export class DeviceDetailView {
                                 <span class="coords-text">${group.coordinates.latitude.toFixed(6)}, ${group.coordinates.longitude.toFixed(6)}</span>
                                 <div class="map-links">
                                     <a href="https://maps.google.com/maps?q=${group.coordinates.latitude},${group.coordinates.longitude}" target="_blank" class="map-link google-maps">
-                                        🌍 Google Maps
+                                        <i class="fa-solid fa-globe"></i> Google Maps
                                     </a>
                                     <a href="https://maps.apple.com/?q=${group.coordinates.latitude},${group.coordinates.longitude}" target="_blank" class="map-link apple-maps">
-                                        🍎 Apple Maps
+                                        <i class="fa-solid fa-map"></i> Apple Maps
                                     </a>
                                 </div>
                             </div>
@@ -241,7 +241,7 @@ export class DeviceDetailView {
                         <div class="timeline-entry-count">
                             ${group.locations.length} entries
                             <button class="delete-group-btn" data-group-locations="${group.locations.map(l => l.id).join(',')}">
-                                🗑️ Delete All
+                                <i class="fa-solid fa-trash-can"></i> Delete All
                             </button>
                         </div>
                     </div>
@@ -302,10 +302,10 @@ export class DeviceDetailView {
                             <span class="coords-text">${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}</span>
                             <div class="map-links">
                                 <a href="https://maps.google.com/maps?q=${location.latitude},${location.longitude}" target="_blank" class="map-link google-maps">
-                                    🌍 Google Maps
+                                    <i class="fa-solid fa-globe"></i> Google Maps
                                 </a>
                                 <a href="https://maps.apple.com/?q=${location.latitude},${location.longitude}" target="_blank" class="map-link apple-maps">
-                                    🍎 Apple Maps
+                                    <i class="fa-solid fa-map"></i> Apple Maps
                                 </a>
                             </div>
                         </div>
@@ -317,7 +317,7 @@ export class DeviceDetailView {
                     ` : ''}
                     <div class="timeline-actions">
                         <button class="delete-btn" data-location-id="${location.id}">
-                            🗑️ Delete
+                            <i class="fa-solid fa-trash-can"></i> Delete
                         </button>
                     </div>
                 </div>

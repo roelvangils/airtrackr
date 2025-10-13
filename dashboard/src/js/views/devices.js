@@ -45,30 +45,30 @@ export class DevicesView {
                         </div>
                         <div class="device-meta-table" data-device-id="${deviceId}">
                             <div class="meta-row">
-                                <span class="meta-label">🕐 Last seen</span>
+                                <span class="meta-label"><i class="fa-solid fa-clock"></i> Last seen</span>
                                 <span class="meta-value">${lastSeen}</span>
                             </div>
                             <div class="meta-row">
-                                <span class="meta-label">📅 First seen</span>
+                                <span class="meta-label"><i class="fa-solid fa-calendar"></i> First seen</span>
                                 <span class="meta-value">${firstSeen}</span>
                             </div>
                             <div class="meta-row">
-                                <span class="meta-label">📊 Locations</span>
+                                <span class="meta-label"><i class="fa-solid fa-list"></i> Locations</span>
                                 <span class="meta-value">${locationCount} location${locationCount !== 1 ? 's' : ''}</span>
                             </div>
                             <div class="meta-row current-distance-row">
-                                <span class="meta-label">📏 Current distance</span>
+                                <span class="meta-label"><i class="fa-solid fa-ruler"></i> Current distance</span>
                                 <span class="meta-value current-distance-value" data-device-id="${deviceId}">Calculating...</span>
                             </div>
                             ${device.latest_location ? `
                                 <div class="meta-row">
-                                    <span class="meta-label">📍 Latest location</span>
+                                    <span class="meta-label"><i class="fa-solid fa-location-dot"></i> Latest location</span>
                                     <span class="meta-value">${this.escapeHtml(device.latest_location)}</span>
                                 </div>
                             ` : ''}
                             ${device.latest_coordinates ? `
                                 <div class="meta-row">
-                                    <span class="meta-label">🌍 Coordinates</span>
+                                    <span class="meta-label"><i class="fa-solid fa-globe"></i> Coordinates</span>
                                     <span class="meta-value">${this.escapeHtml(device.latest_coordinates)}</span>
                                 </div>
                             ` : ''}
