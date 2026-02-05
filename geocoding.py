@@ -117,6 +117,15 @@ class Geocoder:
 
         try:
             with get_connection() as conn:
+                # Don't overwrite valid coordinates with NULL (e.g. when offline)
+                if latitude is None or longitude is None:
+                    existing = conn.execute(
+                        'SELECT latitude FROM geocoding_cache WHERE location_text = ? AND latitude IS NOT NULL',
+                        (location_text.strip(),)
+                    ).fetchone()
+                    if existing:
+                        return
+
                 conn.execute('''
                     INSERT OR REPLACE INTO geocoding_cache
                     (location_text, latitude, longitude, street, house_number, postal_code, city, country, address_json)
