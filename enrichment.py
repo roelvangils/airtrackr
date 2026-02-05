@@ -75,6 +75,18 @@ def get_home_coordinates() -> Optional[Tuple[float, float]]:
         logger.info(f"Home coordinates resolved: ({lat:.6f}, {lon:.6f})")
         return _home_coords
 
+    # Fallback: check geocoding_cache directly (ignoring expiry) — useful when offline
+    with get_connection() as conn:
+        cleaned = geocoder.clean_location_text(address)
+        row = conn.execute(
+            'SELECT latitude, longitude FROM geocoding_cache WHERE location_text = ? AND latitude IS NOT NULL',
+            (cleaned,)
+        ).fetchone()
+        if row:
+            _home_coords = (row[0], row[1])
+            logger.info(f"Home coordinates from cache fallback: ({row[0]:.6f}, {row[1]:.6f})")
+            return _home_coords
+
     logger.warning(f"Could not geocode Home address: {address}")
     return None
 
