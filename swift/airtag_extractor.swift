@@ -26,13 +26,15 @@ struct AirTagDevice: Codable {
     let distance: String    // e.g., "0 km", "1.5 km", "-"
     let rawText: String     // Original text for debugging
     let extractedAt: Date
-    
+    let batteryStatus: String?  // e.g., "Low", "Normal", nil if not available
+
     var description: String {
+        let batteryStr = batteryStatus.map { ", Battery: \($0)" } ?? ""
         return """
         Device: \(name)
           Location: \(location)
           Status: \(timeStatus)
-          Distance: \(distance)
+          Distance: \(distance)\(batteryStr)
         """
     }
 }
@@ -65,7 +67,7 @@ func getProcessID(forAppName appName: String) -> pid_t? {
 /// Parse device information from Find My text format
 /// - Parameter text: Raw text from Find My UI element
 /// - Returns: Parsed AirTagDevice if format matches, nil otherwise
-func parseDeviceInfo(from text: String) -> AirTagDevice? {
+func parseDeviceInfo(from text: String, batteryStatus: String? = nil) -> AirTagDevice? {
     // Known patterns:
     // 1. "Device Name, Location, Time, Distance" - e.g. "Auto, François Laurentplein, Ghent , 10 min ago, 0,7 km"
     // 2. "Device Name, Location, Time, Distance" - e.g. "Black Valize, Home , 4 min ago, 0 km"
@@ -95,69 +97,75 @@ func parseDeviceInfo(from text: String) -> AirTagDevice? {
                 timeStatus: status,
                 distance: "-",
                 rawText: trimmedText,
-                extractedAt: Date()
+                extractedAt: Date(),
+                batteryStatus: batteryStatus
             )
         }
     }
     
-    // Case 2: Device with full location info (4+ components)
+    // Helper: does this string look like a time status?
+    func looksLikeTime(_ s: String) -> Bool {
+        return s == "Now" || s == "Paused" || s == "Yesterday" ||
+               s.contains("ago") || s.hasPrefix("Last") ||
+               s.range(of: #"^\d+\s+(min|hours?|mo|days?|weeks?)"#, options: .regularExpression) != nil
+    }
+
+    // Case 2: Device with location + time + distance (4+ components)
+    // Format: "Name, Street, City, 10 min ago, 0,7 km"
     if components.count >= 4 {
-        // Last component should be distance
-        let distance = components[components.count - 1]
-        
-        // Second to last should be time/status
-        let timeStatus = components[components.count - 2]
-        
-        // Everything between device name and status is location
-        // Handle multi-part locations (e.g., "Street, City")
-        let locationParts = components[1..<components.count - 2]
-        let location = locationParts.joined(separator: ", ")
-        
-        // Check for special case: decimal distances like "0,7 km" 
-        // These get split incorrectly because of the comma
-        var actualDistance = distance
-        var actualTimeStatus = timeStatus
-        var actualLocation = location
-        
-        // If we have extra components and distance looks wrong, check for split decimal
-        if components.count >= 5 && distance == "7 km" {
-            // Check if previous component is "0"
-            let possibleDecimalPart = components[components.count - 3]
-            if possibleDecimalPart == "0" {
-                // This is likely "0,7 km" that got split
-                actualDistance = "0,7 km"
-                actualTimeStatus = components[components.count - 4]
-                // Recalculate location
-                let locationParts = components[1..<components.count - 4]
-                actualLocation = locationParts.joined(separator: ", ")
+        let lastComp = components[components.count - 1]
+
+        // Check if the last component is a valid distance (e.g., "0 km", "500 m")
+        let lastIsDistance = lastComp.range(of: #"^\d+\s*(km|m)$"#, options: .regularExpression) != nil
+
+        if lastIsDistance {
+            var actualDistance = lastComp
+            var timeStatusIndex = components.count - 2
+
+            // Check for split decimal distance (European comma: "0", "7 km" → "0,7 km")
+            let prevComp = components[components.count - 2]
+            if components.count >= 5 && prevComp.allSatisfy({ $0.isNumber }) {
+                actualDistance = "\(prevComp),\(lastComp)"
+                timeStatusIndex = components.count - 3
             }
-        }
-        
-        // Validate that this looks like device info
-        // Distance should contain "km" or "m" or be a number
-        let looksLikeDistance = actualDistance.contains("km") || 
-                               actualDistance.contains("m") || 
-                               Double(actualDistance.replacingOccurrences(of: ",", with: ".")) != nil
-        
-        // Time status patterns: "Now", "Paused", "X min ago", "X hours ago", etc.
-        let looksLikeTimeStatus = actualTimeStatus == "Now" || 
-                                 actualTimeStatus == "Paused" ||
-                                 actualTimeStatus.contains("ago") ||
-                                 actualTimeStatus.contains("min") ||
-                                 actualTimeStatus.contains("hour")
-        
-        if looksLikeDistance || looksLikeTimeStatus {
+
+            let actualTimeStatus = components[timeStatusIndex]
+            let locationParts = components[1..<timeStatusIndex]
+            let actualLocation = locationParts.joined(separator: ", ")
+
             return AirTagDevice(
                 name: deviceName,
                 location: actualLocation.isEmpty ? "Unknown" : actualLocation,
                 timeStatus: actualTimeStatus,
                 distance: actualDistance,
                 rawText: trimmedText,
-                extractedAt: Date()
+                extractedAt: Date(),
+                batteryStatus: batteryStatus
             )
         }
     }
-    
+
+    // Case 3: Device with location + time but NO distance (3+ components)
+    // Format: "Auto, François Laurentplein, Ghent, 15 min ago"
+    if components.count >= 3 {
+        let lastComp = components[components.count - 1]
+
+        if looksLikeTime(lastComp) {
+            let locationParts = components[1..<components.count - 1]
+            let location = locationParts.joined(separator: ", ")
+
+            return AirTagDevice(
+                name: deviceName,
+                location: location.isEmpty ? "Unknown" : location,
+                timeStatus: lastComp,
+                distance: "-",
+                rawText: trimmedText,
+                extractedAt: Date(),
+                batteryStatus: batteryStatus
+            )
+        }
+    }
+
     return nil
 }
 
@@ -169,17 +177,38 @@ func parseDeviceInfo(from text: String) -> AirTagDevice? {
 func extractAirTagDevices(from element: AXUIElement) -> [AirTagDevice] {
     var devices: [AirTagDevice] = []
     var processedTexts = Set<String>() // Avoid duplicates
-    
+    // Collect battery hints from AXImage elements (experimental)
+    var batteryHints: [String] = []
+
     /// Recursively process UI elements
     func processElement(_ elem: AXUIElement, depth: Int = 0) {
         // Limit recursion depth to prevent infinite loops
         guard depth < 20 else { return }
-        
+
         // Get element role
         var role: CFTypeRef?
         AXUIElementCopyAttributeValue(elem, kAXRoleAttribute as CFString, &role)
         let roleStr = role as? String ?? ""
-        
+
+        // Look for battery-related AXImage elements
+        if roleStr == "AXImage" {
+            var imgDesc: CFTypeRef?
+            if AXUIElementCopyAttributeValue(elem, kAXDescriptionAttribute as CFString, &imgDesc) == .success,
+               let imgStr = imgDesc as? String {
+                let lower = imgStr.lowercased()
+                if lower.contains("battery") || lower.contains("low") || lower.contains("critical") {
+                    // Normalize to a status string
+                    if lower.contains("critical") {
+                        batteryHints.append("Critical")
+                    } else if lower.contains("low") {
+                        batteryHints.append("Low")
+                    } else {
+                        batteryHints.append("Normal")
+                    }
+                }
+            }
+        }
+
         // Look for static text elements (these contain device info)
         if roleStr == "AXStaticText" {
             // Try to get description (primary text source)
@@ -187,35 +216,35 @@ func extractAirTagDevices(from element: AXUIElement) -> [AirTagDevice] {
             if AXUIElementCopyAttributeValue(elem, kAXDescriptionAttribute as CFString, &desc) == .success,
                let descStr = desc as? String,
                !descStr.isEmpty {
-                
+
                 // Check if this looks like device info and hasn't been processed
                 if descStr.contains(",") && !processedTexts.contains(descStr) {
                     processedTexts.insert(descStr)
-                    
+
                     // Filter out UI elements that aren't devices
                     let isNotDevice = descStr.contains("Map pin") ||
                                      descStr.contains("My Location") ||
                                      descStr.hasPrefix("AXURL")
-                    
+
                     if !isNotDevice, let device = parseDeviceInfo(from: descStr) {
                         devices.append(device)
                     }
                 }
             }
-            
+
             // Also check value attribute as fallback
             var value: CFTypeRef?
             if AXUIElementCopyAttributeValue(elem, kAXValueAttribute as CFString, &value) == .success,
                let valueStr = value as? String,
                !valueStr.isEmpty && !processedTexts.contains(valueStr) {
-                
+
                 if valueStr.contains(","), let device = parseDeviceInfo(from: valueStr) {
                     processedTexts.insert(valueStr)
                     devices.append(device)
                 }
             }
         }
-        
+
         // Recursively process children
         var children: CFTypeRef?
         if AXUIElementCopyAttributeValue(elem, kAXChildrenAttribute as CFString, &children) == .success,
@@ -225,20 +254,38 @@ func extractAirTagDevices(from element: AXUIElement) -> [AirTagDevice] {
             }
         }
     }
-    
+
     processElement(element)
-    
+
+    // Try to associate battery hints with devices (positional heuristic:
+    // if we found exactly as many hints as devices, pair them in order)
+    if !batteryHints.isEmpty && batteryHints.count == devices.count {
+        var enriched: [AirTagDevice] = []
+        for (i, device) in devices.enumerated() {
+            enriched.append(AirTagDevice(
+                name: device.name,
+                location: device.location,
+                timeStatus: device.timeStatus,
+                distance: device.distance,
+                rawText: device.rawText,
+                extractedAt: device.extractedAt,
+                batteryStatus: batteryHints[i]
+            ))
+        }
+        devices = enriched
+    }
+
     // Remove duplicates based on device name
     var uniqueDevices: [AirTagDevice] = []
     var seenNames = Set<String>()
-    
+
     for device in devices {
         if !seenNames.contains(device.name) {
             seenNames.insert(device.name)
             uniqueDevices.append(device)
         }
     }
-    
+
     return uniqueDevices
 }
 
@@ -367,13 +414,6 @@ func main() {
 /// Simple stderr printing
 func printToStderr(_ message: String) {
     fputs(message + "\n", stderr)
-}
-
-/// String extension for numeric checking
-extension String {
-    func isNumeric() -> Bool {
-        return Double(self) != nil
-    }
 }
 
 // Run the main function

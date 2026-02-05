@@ -1,52 +1,89 @@
 export class DeviceDetailView {
-    constructor(device, locations, router, apiService) {
+    constructor(device, locations, total, router, apiService) {
         this.device = device;
         this.locations = locations;
+        this.total = total;
         this.router = router;
         this.apiService = apiService;
+        this.offset = locations.length;
+        this.limit = 50;
+        this.startDate = null;
+        this.endDate = null;
     }
-    
+
     render() {
+        const deviceName = this.device.name || this.device.device_name || 'Unknown Device';
         return `
             <div class="timeline-container">
                 <button class="back-btn" data-route="/">
-                    ← Back to Dashboard
+                    Back to Dashboard
                 </button>
 
                 <div class="timeline-header">
-                    <h2>${this.escapeHtml(this.device.name || this.device.device_name || 'Unknown Device')}</h2>
+                    <h2>${this.escapeHtml(deviceName)}</h2>
                     <div class="timeline-meta">
-                        ${this.locations.length} location${this.locations.length !== 1 ? 's' : ''} recorded
-                        ${this.device.first_seen ? `• First seen ${new Date(this.device.first_seen).toLocaleDateString()}` : ''}
+                        ${this.total} location${this.total !== 1 ? 's' : ''} recorded
+                        ${this.device.first_seen ? `&bull; First seen ${new Date(this.device.first_seen).toLocaleDateString()}` : ''}
                     </div>
                 </div>
 
+                ${this.renderExportButtons()}
+                ${this.renderDateFilter()}
                 ${this.renderMap()}
-
                 ${this.renderTimeline()}
-
+                ${this.renderLoadMore()}
                 ${this.renderDangerZone()}
             </div>
         `;
     }
 
+    renderExportButtons() {
+        const deviceName = this.device.name || this.device.device_name;
+        const csvUrl = this.apiService.getExportUrl(deviceName, 'csv', this.startDate, this.endDate);
+        const gpxUrl = this.apiService.getExportUrl(deviceName, 'gpx', this.startDate, this.endDate);
+
+        return `
+            <div class="export-buttons">
+                <a href="${csvUrl}" class="export-btn" download>
+                    <i class="fa-solid fa-file-csv"></i> Export CSV
+                </a>
+                <a href="${gpxUrl}" class="export-btn" download>
+                    <i class="fa-solid fa-route"></i> Export GPX
+                </a>
+            </div>
+        `;
+    }
+
+    renderDateFilter() {
+        return `
+            <div class="date-filter">
+                <div class="date-filter-inputs">
+                    <label>
+                        <span>From</span>
+                        <input type="date" id="filter-start-date" ${this.startDate ? `value="${this.startDate.split('T')[0]}"` : ''}>
+                    </label>
+                    <label>
+                        <span>To</span>
+                        <input type="date" id="filter-end-date" ${this.endDate ? `value="${this.endDate.split('T')[0]}"` : ''}>
+                    </label>
+                </div>
+                <div class="date-filter-actions">
+                    <button class="date-filter-btn apply-date-filter" id="apply-date-filter">Apply</button>
+                    <button class="date-filter-btn clear-date-filter" id="clear-date-filter">Clear</button>
+                </div>
+            </div>
+        `;
+    }
+
     renderMap() {
-        // Get the most recent location with coordinates
         if (!this.locations || this.locations.length === 0) {
             return '';
         }
 
-        // Sort by timestamp to get the most recent
-        const sortedLocations = [...this.locations].sort((a, b) =>
-            new Date(b.timestamp) - new Date(a.timestamp)
-        );
+        // Find locations with coordinates for the route
+        const locationsWithCoords = this.locations.filter(loc => loc.latitude && loc.longitude);
 
-        // Find the first location with valid coordinates
-        const locationWithCoords = sortedLocations.find(loc =>
-            loc.latitude && loc.longitude
-        );
-
-        if (!locationWithCoords) {
+        if (locationsWithCoords.length === 0) {
             return `
                 <div class="map-container">
                     <div class="map-placeholder">
@@ -56,34 +93,82 @@ export class DeviceDetailView {
             `;
         }
 
-        const { latitude, longitude } = locationWithCoords;
-        const locationText = this.processLocationText(locationWithCoords.location || locationWithCoords.location_text);
+        const latest = locationsWithCoords[0];
+        const locationText = this.processLocationText(latest.location || latest.location_text);
 
         return `
             <div class="map-container">
                 <div class="map-header">
-                    <h3><i class="fa-solid fa-location-dot"></i> Last Known Location</h3>
+                    <h3><i class="fa-solid fa-location-dot"></i> Location Map</h3>
                     <div class="map-location-name">${this.escapeHtml(locationText)}</div>
                 </div>
-                <div class="map-wrapper">
-                    <iframe
-                        class="google-maps-embed"
-                        src="https://maps.google.com/maps?q=${latitude},${longitude}&output=embed"
-                        frameborder="0"
-                        allowfullscreen
-                        loading="lazy">
-                    </iframe>
-                </div>
+                <div class="map-wrapper" id="leaflet-map" style="height: 400px;"></div>
                 <div class="map-footer">
-                    <a href="https://maps.apple.com/?q=${latitude},${longitude}" target="_blank" class="map-link">
+                    <a href="https://maps.apple.com/?q=${latest.latitude},${latest.longitude}" target="_blank" class="map-link">
                         <i class="fa-solid fa-map"></i> Open in Apple Maps
                     </a>
-                    <a href="https://maps.google.com/maps?q=${latitude},${longitude}" target="_blank" class="map-link">
+                    <a href="https://maps.google.com/maps?q=${latest.latitude},${latest.longitude}" target="_blank" class="map-link">
                         <i class="fa-solid fa-globe"></i> Open in Google Maps
                     </a>
                 </div>
             </div>
         `;
+    }
+
+    initLeafletMap() {
+        const mapEl = document.getElementById('leaflet-map');
+        if (!mapEl || typeof L === 'undefined') return;
+
+        const locationsWithCoords = this.locations
+            .filter(loc => loc.latitude && loc.longitude)
+            .reverse(); // oldest first for polyline
+
+        if (locationsWithCoords.length === 0) return;
+
+        const latest = locationsWithCoords[locationsWithCoords.length - 1];
+        const map = L.map('leaflet-map').setView([latest.latitude, latest.longitude], 14);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors',
+            maxZoom: 19
+        }).addTo(map);
+
+        // Build polyline coords
+        const coords = locationsWithCoords.map(loc => [loc.latitude, loc.longitude]);
+
+        if (coords.length > 1) {
+            L.polyline(coords, {
+                color: '#007AFF',
+                weight: 3,
+                opacity: 0.7
+            }).addTo(map);
+        }
+
+        // Start marker (oldest)
+        const first = locationsWithCoords[0];
+        L.marker([first.latitude, first.longitude], {
+            icon: L.divIcon({
+                className: 'leaflet-marker-start',
+                html: '<div style="background:#34C759;width:14px;height:14px;border-radius:50%;border:3px solid white;box-shadow:0 0 4px rgba(0,0,0,0.3);"></div>',
+                iconSize: [14, 14],
+                iconAnchor: [7, 7]
+            })
+        }).addTo(map).bindPopup(`Start: ${this.processLocationText(first.location)}`);
+
+        // End marker (most recent)
+        L.marker([latest.latitude, latest.longitude], {
+            icon: L.divIcon({
+                className: 'leaflet-marker-end',
+                html: '<div style="background:#FF3B30;width:14px;height:14px;border-radius:50%;border:3px solid white;box-shadow:0 0 4px rgba(0,0,0,0.3);"></div>',
+                iconSize: [14, 14],
+                iconAnchor: [7, 7]
+            })
+        }).addTo(map).bindPopup(`Latest: ${this.processLocationText(latest.location)}`);
+
+        // Auto-fit bounds
+        if (coords.length > 1) {
+            map.fitBounds(coords, { padding: [30, 30] });
+        }
     }
 
     renderTimeline() {
@@ -94,15 +179,13 @@ export class DeviceDetailView {
                 </div>
             `;
         }
-        
-        // Sort locations by timestamp (most recent first)
-        const sortedLocations = [...this.locations].sort((a, b) => 
+
+        const sortedLocations = [...this.locations].sort((a, b) =>
             new Date(b.timestamp) - new Date(a.timestamp)
         );
-        
-        // Group consecutive identical locations
+
         const groupedLocations = this.groupConsecutiveLocations(sortedLocations);
-        
+
         return `
             <div class="timeline">
                 ${groupedLocations.map(group => this.renderTimelineGroup(group)).join('')}
@@ -110,9 +193,23 @@ export class DeviceDetailView {
         `;
     }
 
+    renderLoadMore() {
+        if (this.locations.length >= this.total) {
+            return '';
+        }
+        return `
+            <div class="load-more-container">
+                <button class="load-more-btn" id="load-more-btn">
+                    <i class="fa-solid fa-arrow-down"></i>
+                    Load More (${this.locations.length} of ${this.total})
+                </button>
+            </div>
+        `;
+    }
+
     groupConsecutiveLocations(locations) {
         if (locations.length === 0) return [];
-        
+
         const groups = [];
         let currentGroup = {
             locations: [locations[0]],
@@ -125,17 +222,15 @@ export class DeviceDetailView {
             },
             distance: locations[0].distance_meters
         };
-        
+
         for (let i = 1; i < locations.length; i++) {
             const current = locations[i];
             const currentCleanLocation = this.processLocationText(current.location || current.location_text);
-            
-            // Check if this location should be grouped with the previous one
+
             if (this.shouldGroupLocations(currentGroup.cleanLocation, currentCleanLocation)) {
                 currentGroup.locations.push(current);
                 currentGroup.endTime = new Date(current.timestamp);
-                
-                // Use coordinates from the most recent entry that has them
+
                 if (current.latitude && current.longitude) {
                     currentGroup.coordinates = {
                         latitude: current.latitude,
@@ -143,7 +238,6 @@ export class DeviceDetailView {
                     };
                 }
             } else {
-                // Start a new group
                 groups.push(currentGroup);
                 currentGroup = {
                     locations: [current],
@@ -158,17 +252,15 @@ export class DeviceDetailView {
                 };
             }
         }
-        
-        // Don't forget the last group
+
         groups.push(currentGroup);
-        
         return groups;
     }
-    
+
     renderDangerZone() {
         const deviceId = this.device.id || this.device.device_id;
         const deviceName = this.device.name || this.device.device_name || 'Unknown Device';
-        
+
         return `
             <div class="danger-zone">
                 <div class="danger-zone-header">
@@ -191,12 +283,8 @@ export class DeviceDetailView {
     }
 
     shouldGroupLocations(location1, location2) {
-        // Group identical locations
         if (location1 === location2) return true;
-        
-        // Group all "Location not available" entries
         if (location1 === 'Location not available' && location2 === 'Location not available') return true;
-        
         return false;
     }
 
@@ -204,13 +292,12 @@ export class DeviceDetailView {
         const isMultipleEntries = group.locations.length > 1;
         const startDate = group.startTime;
         const endDate = group.endTime;
-        
+
         if (isMultipleEntries) {
-            // Show duration format for grouped entries
             const duration = this.calculateDuration(startDate, endDate);
             const startFormatted = startDate.toLocaleString();
             const endFormatted = endDate.toLocaleString();
-            
+
             return `
                 <div class="timeline-item timeline-group">
                     <div class="timeline-content">
@@ -248,7 +335,6 @@ export class DeviceDetailView {
                 </div>
             `;
         } else {
-            // Single entry - use the original format
             return this.renderTimelineItem(group.locations[0]);
         }
     }
@@ -258,36 +344,31 @@ export class DeviceDetailView {
         const diffMinutes = Math.floor(diffMs / (1000 * 60));
         const diffHours = Math.floor(diffMinutes / 60);
         const diffDays = Math.floor(diffHours / 24);
-        
+
         if (diffDays > 0) {
             const remainingHours = diffHours % 24;
             if (remainingHours > 0) {
                 return `${diffDays} day${diffDays !== 1 ? 's' : ''}, ${remainingHours} hour${remainingHours !== 1 ? 's' : ''}`;
-            } else {
-                return `${diffDays} day${diffDays !== 1 ? 's' : ''}`;
             }
+            return `${diffDays} day${diffDays !== 1 ? 's' : ''}`;
         } else if (diffHours > 0) {
             const remainingMinutes = diffMinutes % 60;
             if (remainingMinutes > 0) {
                 return `${diffHours} hour${diffHours !== 1 ? 's' : ''}, ${remainingMinutes} minute${remainingMinutes !== 1 ? 's' : ''}`;
-            } else {
-                return `${diffHours} hour${diffHours !== 1 ? 's' : ''}`;
             }
+            return `${diffHours} hour${diffHours !== 1 ? 's' : ''}`;
         } else if (diffMinutes > 0) {
             return `${diffMinutes} minute${diffMinutes !== 1 ? 's' : ''}`;
-        } else {
-            return 'Less than a minute';
         }
+        return 'Less than a minute';
     }
-    
+
     renderTimelineItem(location) {
         const date = new Date(location.timestamp);
         const timeAgo = this.getTimeAgo(date);
         const fullDate = date.toLocaleString();
-        
-        // Process location text to filter out invalid entries and clean up formatting
         const cleanLocation = this.processLocationText(location.location || location.location_text);
-        
+
         return `
             <div class="timeline-item">
                 <div class="timeline-content">
@@ -329,45 +410,33 @@ export class DeviceDetailView {
         if (!locationText) {
             return 'Location not available';
         }
-        
-        // Handle Swift tracker format: "Location, Time ago" or "Location, Paused"
-        // Remove time information from the end of the location string
+
         let cleaned = locationText.trim();
-        
-        // Remove time suffixes like ", 15 min ago" or ", Paused"
+
         cleaned = cleaned.replace(/,\s*\d+\s*(min|hr|hour|minute)s?\s*ago$/i, '');
         cleaned = cleaned.replace(/,\s*(Paused|paused)$/i, '');
-        
-        // Filter out invalid location patterns
+
         const invalidPatterns = [
-            /^lastseen\d+\w*ago$/i,  // Matches "Lastseen1hrago", "Lastseen2hrago", etc.
-            /^last\s*seen/i,         // Matches "last seen" variations
-            /^seen\s*\d+/i,          // Matches "seen 1hr ago" variations
-            /^\d+\s*(hr|min|hour|minute)s?\s*ago$/i, // Time ago patterns only
-            /^No location found$/i    // Swift tracker "No location found"
+            /^lastseen\d+\w*ago$/i,
+            /^last\s*seen/i,
+            /^seen\s*\d+/i,
+            /^\d+\s*(hr|min|hour|minute)s?\s*ago$/i,
+            /^No location found$/i
         ];
-        
+
         for (const pattern of invalidPatterns) {
             if (pattern.test(cleaned)) {
                 return 'Location not available';
             }
         }
-        
-        // Remove trailing characters like "-1", "-", ".", ":"
+
         cleaned = cleaned.replace(/[-:.]\d*$/, '');
         cleaned = cleaned.replace(/[-:.]$/, '');
-        
-        // Clean up common OCR artifacts
-        cleaned = cleaned.replace(/\s+/g, ' '); // Multiple spaces to single space
-        // Note: Don't strip Unicode characters - keep accented letters like ç, é, ñ, etc.
-        
-        // Format known location patterns
+        cleaned = cleaned.replace(/\s+/g, ' ');
+
         if (cleaned.toLowerCase() === 'home') {
             return 'Home';
         }
-
-        // Note: Don't auto-capitalize - breaks Unicode names like "François"
-        // Data already comes properly capitalized from the database
 
         return cleaned || 'Location not available';
     }
@@ -383,6 +452,8 @@ export class DeviceDetailView {
     }
 
     bindEvents() {
+        // Initialize Leaflet map
+        this.initLeafletMap();
 
         // Handle delete single location
         document.querySelectorAll('.delete-btn').forEach(btn => {
@@ -394,7 +465,7 @@ export class DeviceDetailView {
                 }
             });
         });
-        
+
         // Handle delete location group
         document.querySelectorAll('.delete-group-btn').forEach(btn => {
             btn.addEventListener('click', async (e) => {
@@ -405,7 +476,7 @@ export class DeviceDetailView {
                 }
             });
         });
-        
+
         // Handle delete device
         document.querySelectorAll('.delete-device-btn').forEach(btn => {
             btn.addEventListener('click', async (e) => {
@@ -415,75 +486,149 @@ export class DeviceDetailView {
                 await this.showDeleteDeviceConfirmation(deviceId, deviceName);
             });
         });
+
+        // Handle "Load More" button
+        const loadMoreBtn = document.getElementById('load-more-btn');
+        if (loadMoreBtn) {
+            loadMoreBtn.addEventListener('click', () => this.loadMore());
+        }
+
+        // Handle date filter
+        const applyBtn = document.getElementById('apply-date-filter');
+        const clearBtn = document.getElementById('clear-date-filter');
+        if (applyBtn) {
+            applyBtn.addEventListener('click', () => this.applyDateFilter());
+        }
+        if (clearBtn) {
+            clearBtn.addEventListener('click', () => this.clearDateFilter());
+        }
     }
-    
-    async deleteLocation(locationId) {
+
+    async loadMore() {
+        const deviceName = this.device.name || this.device.device_name;
+        const btn = document.getElementById('load-more-btn');
+        if (btn) btn.textContent = 'Loading...';
+
         try {
-            console.log('Attempting to delete location:', locationId);
-            const result = await this.apiService.deleteLocation(locationId);
-            console.log('Delete result:', result);
-            
-            // Remove from local array
-            this.locations = this.locations.filter(loc => loc.id != locationId);
-            // Re-render the view
+            const response = await this.apiService.getDeviceLocations(
+                deviceName, this.limit, this.offset, this.startDate, this.endDate
+            );
+            const newLocations = response.locations;
+
+            if (newLocations.length > 0) {
+                this.locations = [...this.locations, ...newLocations];
+                this.offset += newLocations.length;
+
+                // Re-render everything
+                const contentElement = document.querySelector('#main-content');
+                if (contentElement) {
+                    contentElement.innerHTML = this.render();
+                    this.bindEvents();
+                }
+            }
+        } catch (error) {
+            console.error('Failed to load more:', error);
+            if (btn) btn.textContent = 'Load More (failed, try again)';
+        }
+    }
+
+    async applyDateFilter() {
+        const startInput = document.getElementById('filter-start-date');
+        const endInput = document.getElementById('filter-end-date');
+
+        this.startDate = startInput?.value ? `${startInput.value}T00:00:00` : null;
+        this.endDate = endInput?.value ? `${endInput.value}T23:59:59` : null;
+
+        const deviceName = this.device.name || this.device.device_name;
+
+        try {
+            const response = await this.apiService.getDeviceLocations(
+                deviceName, this.limit, 0, this.startDate, this.endDate
+            );
+            this.locations = response.locations;
+            this.total = response.total;
+            this.offset = this.locations.length;
+
             const contentElement = document.querySelector('#main-content');
             if (contentElement) {
                 contentElement.innerHTML = this.render();
                 this.bindEvents();
             }
-            
-            console.log('Location deleted successfully');
+        } catch (error) {
+            console.error('Failed to apply date filter:', error);
+        }
+    }
+
+    async clearDateFilter() {
+        this.startDate = null;
+        this.endDate = null;
+
+        const deviceName = this.device.name || this.device.device_name;
+
+        try {
+            const response = await this.apiService.getDeviceLocations(deviceName, this.limit, 0);
+            this.locations = response.locations;
+            this.total = response.total;
+            this.offset = this.locations.length;
+
+            const contentElement = document.querySelector('#main-content');
+            if (contentElement) {
+                contentElement.innerHTML = this.render();
+                this.bindEvents();
+            }
+        } catch (error) {
+            console.error('Failed to clear date filter:', error);
+        }
+    }
+
+    async deleteLocation(locationId) {
+        try {
+            await this.apiService.deleteLocation(locationId);
+
+            this.locations = this.locations.filter(loc => loc.id != locationId);
+            this.total = Math.max(0, this.total - 1);
+
+            const contentElement = document.querySelector('#main-content');
+            if (contentElement) {
+                contentElement.innerHTML = this.render();
+                this.bindEvents();
+            }
         } catch (error) {
             console.error('Failed to delete location:', error);
             alert(`Failed to delete location: ${error.message}`);
         }
     }
-    
+
     async deleteLocationGroup(locationIds) {
         try {
-            console.log('Attempting to delete location group:', locationIds);
-            
-            // Get unique location IDs only
             const uniqueLocationIds = [...new Set(locationIds)];
-            console.log('Unique location IDs to delete:', uniqueLocationIds);
-            
-            // Delete each location sequentially to avoid race conditions
+
             const results = [];
             for (const id of uniqueLocationIds) {
                 try {
-                    const result = await this.apiService.deleteLocation(id);
-                    results.push({ id, success: true, result });
+                    await this.apiService.deleteLocation(id);
+                    results.push({ id, success: true });
                 } catch (error) {
-                    console.warn(`Failed to delete location ${id}:`, error);
-                    results.push({ id, success: false, error });
+                    results.push({ id, success: false });
                 }
             }
-            
-            console.log('Delete results:', results);
-            
-            // Remove successfully deleted locations from local array
+
             const successfullyDeleted = results.filter(r => r.success).map(r => r.id);
             this.locations = this.locations.filter(loc => !successfullyDeleted.includes(loc.id.toString()));
-            
-            // Re-render the view
+            this.total = Math.max(0, this.total - successfullyDeleted.length);
+
             const contentElement = document.querySelector('#main-content');
             if (contentElement) {
                 contentElement.innerHTML = this.render();
                 this.bindEvents();
             }
-            
-            const successCount = successfullyDeleted.length;
-            const totalCount = uniqueLocationIds.length;
-            console.log(`Successfully deleted ${successCount}/${totalCount} locations`);
-            
         } catch (error) {
             console.error('Failed to delete location group:', error);
             alert(`Failed to delete location group: ${error.message}`);
         }
     }
-    
+
     async showDeleteDeviceConfirmation(deviceId, deviceName) {
-        // Create a more sophisticated confirmation modal
         const confirmed = await this.showConfirmationModal(
             'Delete Device',
             `Are you absolutely sure you want to delete "${deviceName}"?`,
@@ -491,9 +636,8 @@ export class DeviceDetailView {
             'Delete Device',
             'danger'
         );
-        
+
         if (confirmed) {
-            // Show second confirmation
             const doubleConfirmed = await this.showConfirmationModal(
                 'Final Confirmation',
                 `Type "${deviceName}" to confirm deletion:`,
@@ -503,16 +647,15 @@ export class DeviceDetailView {
                 true,
                 deviceName
             );
-            
+
             if (doubleConfirmed) {
                 await this.deleteDevice(deviceId, deviceName);
             }
         }
     }
-    
+
     async showConfirmationModal(title, message, description, buttonText, type = 'default', requireTyping = false, expectedText = '') {
         return new Promise((resolve) => {
-            // Create modal backdrop
             const modal = document.createElement('div');
             modal.className = 'modal-backdrop';
             modal.innerHTML = `
@@ -533,44 +676,38 @@ export class DeviceDetailView {
                     </div>
                 </div>
             `;
-            
+
             document.body.appendChild(modal);
-            
+
             const cancelBtn = modal.querySelector('.modal-btn-cancel');
             const confirmBtn = modal.querySelector(`.modal-btn-${type}`);
             const input = modal.querySelector('.modal-input');
-            
-            // Handle typing confirmation
+
             if (requireTyping && input) {
                 input.addEventListener('input', () => {
                     confirmBtn.disabled = input.value.trim() !== expectedText;
                 });
                 input.focus();
             }
-            
-            // Handle buttons
+
             cancelBtn.addEventListener('click', () => {
                 document.body.removeChild(modal);
                 resolve(false);
             });
-            
+
             confirmBtn.addEventListener('click', () => {
-                if (requireTyping && input.value.trim() !== expectedText) {
-                    return;
-                }
+                if (requireTyping && input.value.trim() !== expectedText) return;
                 document.body.removeChild(modal);
                 resolve(true);
             });
-            
-            // Handle escape key
+
             modal.addEventListener('keydown', (e) => {
                 if (e.key === 'Escape') {
                     document.body.removeChild(modal);
                     resolve(false);
                 }
             });
-            
-            // Close on backdrop click
+
             modal.addEventListener('click', (e) => {
                 if (e.target === modal) {
                     document.body.removeChild(modal);
@@ -579,45 +716,32 @@ export class DeviceDetailView {
             });
         });
     }
-    
+
     async deleteDevice(deviceId, deviceName) {
         try {
-            console.log('Attempting to delete device:', deviceId, deviceName);
-            const result = await this.apiService.deleteDevice(deviceId);
-            console.log('Delete device result:', result);
-            
-            // Show success message
+            await this.apiService.deleteDevice(deviceId);
             alert(`Device "${deviceName}" has been successfully deleted.`);
-            
-            // Navigate back to devices list
             this.router.navigate('/');
-            
         } catch (error) {
             console.error('Failed to delete device:', error);
             alert(`Failed to delete device: ${error.message}`);
         }
     }
-    
+
     getTimeAgo(date) {
         const now = new Date();
         const diffMs = now - date;
         const diffMins = Math.floor(diffMs / (1000 * 60));
         const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
         const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-        
-        if (diffMins < 1) {
-            return 'Just now';
-        } else if (diffMins < 60) {
-            return `${diffMins} minute${diffMins !== 1 ? 's' : ''} ago`;
-        } else if (diffHours < 24) {
-            return `${diffHours} hour${diffHours !== 1 ? 's' : ''} ago`;
-        } else if (diffDays < 7) {
-            return `${diffDays} day${diffDays !== 1 ? 's' : ''} ago`;
-        } else {
-            return date.toLocaleDateString();
-        }
+
+        if (diffMins < 1) return 'Just now';
+        if (diffMins < 60) return `${diffMins} minute${diffMins !== 1 ? 's' : ''} ago`;
+        if (diffHours < 24) return `${diffHours} hour${diffHours !== 1 ? 's' : ''} ago`;
+        if (diffDays < 7) return `${diffDays} day${diffDays !== 1 ? 's' : ''} ago`;
+        return date.toLocaleDateString();
     }
-    
+
     escapeHtml(text) {
         if (typeof text !== 'string') return text;
         const div = document.createElement('div');
