@@ -16,7 +16,6 @@ Total cycle time: ~3 minutes
 """
 
 import json
-import sqlite3
 import subprocess
 import os
 import sys
@@ -25,10 +24,11 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional
-from contextlib import contextmanager
 
 from findmy_automation import FindMyAutomation, DeviceType
 from geocoding import Geocoder
+from db import get_connection, init_schema, is_duplicate, sanitize_device_data, resolve_location_alias
+from enrichment import compute_distance_from_home, update_visits, detect_trips
 
 # Configure logging with DEBUG level for verbose output
 # Create logs directory if it doesn't exist
@@ -59,20 +59,11 @@ class OrchestratedAirTagTracker:
     EXTRACT_PAUSE = 30     # Pause after extracting data
     CYCLE_END_PAUSE = 60   # Pause at end of cycle before repeating
 
-    def __init__(self, db_path: str = "database/airtracker.db"):
-        """
-        Initialize the orchestrated tracker.
-
-        Args:
-            db_path: Path to SQLite database file
-        """
-        self.db_path = db_path
+    def __init__(self):
+        """Initialize the orchestrated tracker."""
         self.swift_extractor = Path(__file__).parent / "swift" / "airtag_extractor"
         self.automation = FindMyAutomation()
         self.geocoder = Geocoder()
-
-        # Ensure database directory exists
-        Path(db_path).parent.mkdir(exist_ok=True)
 
         # Verify Swift extractor exists
         if not self.swift_extractor.exists() or not os.access(self.swift_extractor, os.X_OK):
@@ -83,72 +74,9 @@ class OrchestratedAirTagTracker:
             logger.error(error_msg)
             raise FileNotFoundError(error_msg)
 
-        # Initialize database schema
-        self._init_database()
-        logger.info(f"Initialized orchestrated tracker with database: {self.db_path}")
-
-    def _init_database(self):
-        """Initialize the database schema."""
-        with self._get_db_connection() as conn:
-            cursor = conn.cursor()
-
-            # Create swift_locations table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS swift_locations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    device_name TEXT NOT NULL,
-                    location TEXT,
-                    time_status TEXT,
-                    distance TEXT,
-                    latitude REAL,
-                    longitude REAL,
-                    device_type TEXT CHECK(device_type IN ('person', 'device', 'item')),
-                    raw_data TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    extracted_at TIMESTAMP
-                )
-            ''')
-
-            # Create swift_devices table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS swift_devices (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    device_name TEXT UNIQUE NOT NULL,
-                    device_type TEXT CHECK(device_type IN ('person', 'device', 'item')),
-                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_location TEXT,
-                    update_count INTEGER DEFAULT 0
-                )
-            ''')
-
-            # Create indexes
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_swift_locations_device_name
-                ON swift_locations(device_name)
-            ''')
-
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_swift_locations_timestamp
-                ON swift_locations(timestamp DESC)
-            ''')
-
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_swift_locations_device_type
-                ON swift_locations(device_type)
-            ''')
-
-            conn.commit()
-
-    @contextmanager
-    def _get_db_connection(self):
-        """Context manager for database connections."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-        finally:
-            conn.close()
+        # Initialize database schema via shared module
+        init_schema()
+        logger.info("Initialized orchestrated tracker")
 
     def extract_locations_for_tab(self, device_type: DeviceType, retry_count: int = 3) -> List[Dict]:
         """
@@ -215,43 +143,77 @@ class OrchestratedAirTagTracker:
 
         saved_count = 0
 
-        with self._get_db_connection() as conn:
+        with get_connection() as conn:
             try:
                 cursor = conn.cursor()
 
                 for device_data in devices:
+                    # Sanitize: fix decimal-distance parsing, time-in-location,
+                    # and skip "No location found" noise
+                    cleaned = sanitize_device_data(dict(device_data))
+                    if cleaned is None:
+                        logger.debug(f"Skipping {device_data['name']}: no usable location")
+                        continue
+
                     # Parse extracted_at timestamp
-                    extracted_at = device_data.get('extractedAt', '')
+                    extracted_at = cleaned.get('extractedAt', '')
                     if extracted_at:
                         extracted_at = extracted_at.replace('T', ' ').replace('Z', '')
 
-                    # Geocode the location
-                    location_text = device_data['location']
-                    latitude, longitude = None, None
+                    device_name = cleaned['name']
+                    location_text = cleaned['location']
 
-                    if location_text and location_text != "No location found":
+                    # Skip duplicates within 2-minute window
+                    if is_duplicate(conn, device_name, location_text):
+                        logger.debug(f"Skipping duplicate: {device_name} at {location_text}")
+                        continue
+
+                    # Resolve alias (e.g. "Home" → "Onderstraat 7, 9000 Ghent")
+                    geocode_text = resolve_location_alias(location_text)
+
+                    # Geocode the resolved address
+                    latitude, longitude = None, None
+                    try:
+                        latitude, longitude = self.geocoder.geocode(geocode_text)
+                        if latitude and longitude:
+                            logger.debug(f"Geocoded {location_text} -> ({latitude:.6f}, {longitude:.6f})")
+                    except Exception as e:
+                        logger.warning(f"Geocoding failed for '{geocode_text}': {e}")
+
+                    # Computed timestamp from relative time (e.g. "15 min ago" → absolute)
+                    location_timestamp = cleaned.get('location_timestamp')
+
+                    # Distance from home
+                    dist_home = None
+                    if latitude is not None and longitude is not None:
                         try:
-                            latitude, longitude = self.geocoder.geocode(location_text)
-                            if latitude and longitude:
-                                logger.debug(f"Geocoded {location_text} -> ({latitude:.6f}, {longitude:.6f})")
+                            dist_home = compute_distance_from_home(latitude, longitude)
                         except Exception as e:
-                            logger.warning(f"Geocoding failed for '{location_text}': {e}")
+                            logger.debug(f"Could not compute distance from home: {e}")
+
+                    # Battery status (from Swift extractor, may be None)
+                    battery_status = cleaned.get('batteryStatus')
 
                     # Insert location record with device_type
                     cursor.execute('''
                         INSERT INTO swift_locations
-                        (device_name, location, time_status, distance, latitude, longitude, device_type, raw_data, extracted_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (device_name, location, time_status, distance, latitude, longitude,
+                         device_type, raw_data, extracted_at, location_timestamp,
+                         distance_from_home_km, battery_status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        device_data['name'],
-                        device_data['location'],
-                        device_data['timeStatus'],
-                        device_data['distance'],
+                        device_name,
+                        location_text,
+                        cleaned['timeStatus'],
+                        cleaned['distance'],
                         latitude,
                         longitude,
                         device_type,
-                        json.dumps(device_data),
-                        extracted_at
+                        json.dumps(device_data),  # Store original raw data for debugging
+                        extracted_at,
+                        location_timestamp,
+                        dist_home,
+                        battery_status,
                     ))
 
                     # Update or insert device summary with device_type
@@ -264,22 +226,25 @@ class OrchestratedAirTagTracker:
                             device_type = excluded.device_type,
                             update_count = update_count + 1
                     ''', (
-                        device_data['name'],
+                        device_name,
                         device_type,
-                        device_data['location']
+                        location_text
                     ))
 
                     saved_count += 1
 
+                    # Track visit (dwell time)
+                    ts = location_timestamp or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    try:
+                        update_visits(device_name, location_text, latitude, longitude, ts)
+                    except Exception as e:
+                        logger.debug(f"Visit tracking failed for {device_name}: {e}")
+
                 conn.commit()
                 logger.info(f"Saved {saved_count}/{len(devices)} {device_type} updates")
 
-            except sqlite3.Error as e:
-                logger.error(f"Database error for {device_type} tab: {e}")
-                conn.rollback()
-                return 0
             except Exception as e:
-                logger.error(f"Unexpected error saving {device_type} tab: {e}")
+                logger.error(f"Error saving {device_type} tab: {e}")
                 conn.rollback()
                 return 0
 
@@ -332,6 +297,16 @@ class OrchestratedAirTagTracker:
 
         # Save to database
         saved = self.save_locations(devices, device_type)
+
+        # Detect trips for each device that had new records
+        if saved > 0:
+            device_names = {d['name'] for d in devices}
+            for name in device_names:
+                try:
+                    detect_trips(name, since_minutes=10)
+                except Exception as e:
+                    logger.debug(f"Trip detection failed for {name}: {e}")
+
         return saved > 0
 
     def run_single_cycle(self) -> bool:
@@ -372,10 +347,23 @@ class OrchestratedAirTagTracker:
 
         return success_count > 0
 
+    def _maybe_run_retention(self):
+        """Run retention aggregation if enough time has passed (1x per hour)."""
+        now = datetime.now()
+        if not hasattr(self, '_last_retention') or (now - self._last_retention).total_seconds() >= 3600:
+            try:
+                from retention import run_retention
+                logger.info("Running periodic retention aggregation...")
+                run_retention(dry_run=False, vacuum=False)
+                self._last_retention = now
+            except Exception as e:
+                logger.warning(f"Retention run failed: {e}")
+                self._last_retention = now  # Don't retry immediately
+
     def run_continuous(self):
         """Run continuous tracking with tab cycling."""
         logger.info("=" * 70)
-        logger.info("🚀 STARTING ORCHESTRATED AIRTRACKER (CONTINUOUS MODE)")
+        logger.info("STARTING ORCHESTRATED AIRTRACKER (CONTINUOUS MODE)")
         logger.info("=" * 70)
         logger.info("Configuration:")
         logger.info(f"  - Initial pause: {self.INITIAL_PAUSE}s")
@@ -390,10 +378,11 @@ class OrchestratedAirTagTracker:
         try:
             while True:
                 self.run_single_cycle()
+                self._maybe_run_retention()
                 time.sleep(self.CYCLE_END_PAUSE)
 
         except KeyboardInterrupt:
-            logger.info("\n\n🛑 Orchestrated tracking stopped by user")
+            logger.info("\n\nOrchestrated tracking stopped by user")
 
     def run_scheduled(self, interval_minutes: int):
         """Run scheduled tracking with tab cycling."""
@@ -437,11 +426,6 @@ def main():
         description="Orchestrated AirTag tracker with automatic tab cycling"
     )
     parser.add_argument(
-        '--database', '-d',
-        default='database/airtracker.db',
-        help='Path to SQLite database (default: database/airtracker.db)'
-    )
-    parser.add_argument(
         '--single-cycle',
         action='store_true',
         help='Run a single cycle and exit (useful for testing)'
@@ -457,7 +441,7 @@ def main():
 
     # Initialize tracker
     try:
-        tracker = OrchestratedAirTagTracker(args.database)
+        tracker = OrchestratedAirTagTracker()
     except FileNotFoundError as e:
         print(f"Error: {e}")
         sys.exit(1)

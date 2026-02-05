@@ -9,6 +9,8 @@ class App {
         this.apiService = new ApiService();
         this.mainContent = document.getElementById('main-content');
         this.currentFilter = 'all';
+        this.pollingInterval = null;
+        this.lastDevicesJson = null;
 
         this.setupRoutes();
     }
@@ -38,16 +40,46 @@ class App {
 
             // Setup filter tab event listeners
             this.bindFilterTabs();
+
+            // Start polling (60s interval, only re-render on change)
+            this.startPolling(deviceType);
         } catch (error) {
             this.showError('Failed to load devices: ' + error.message);
         }
+    }
+
+    startPolling(deviceType = null) {
+        this.stopPolling();
+        this.pollingInterval = setInterval(async () => {
+            try {
+                const devices = await this.apiService.getDevices(deviceType);
+                const newJson = JSON.stringify(devices);
+                if (newJson !== this.lastDevicesJson) {
+                    this.lastDevicesJson = newJson;
+                    const devicesView = new DevicesView(devices, this.router, this.apiService);
+                    this.mainContent.innerHTML = devicesView.render();
+                    devicesView.bindEvents();
+                    this.bindFilterTabs();
+                    await this.updateFilterCounts();
+                }
+            } catch (error) {
+                console.error('Polling error:', error);
+            }
+        }, 60000);
+    }
+
+    stopPolling() {
+        if (this.pollingInterval) {
+            clearInterval(this.pollingInterval);
+            this.pollingInterval = null;
+        }
+        this.lastDevicesJson = null;
     }
 
     async updateFilterCounts() {
         try {
             const counts = await this.apiService.getDeviceCounts();
 
-            // Update count displays
             const countAll = document.getElementById('count-all');
             const countPeople = document.getElementById('count-people');
             const countDevices = document.getElementById('count-devices');
@@ -87,29 +119,32 @@ class App {
         const deviceType = filter === 'all' ? null : filter;
         this.showDevicesView(deviceType);
     }
-    
+
     async showDeviceDetail(deviceId) {
         try {
+            // Stop polling when navigating away from devices list
+            this.stopPolling();
+
             // Hide search container and filter tabs on detail view
             this.hideSearchField();
             this.hideFilterTabs();
 
             // Decode the device name from the URL parameter
             const deviceName = decodeURIComponent(deviceId);
-            
+
             const [device, locations] = await Promise.all([
                 this.apiService.getDevice(deviceName),
                 this.apiService.getDeviceLocations(deviceName)
             ]);
-            
-            const detailView = new DeviceDetailView(device, locations.locations, this.router, this.apiService);
+
+            const detailView = new DeviceDetailView(device, locations.locations, locations.total, this.router, this.apiService);
             this.mainContent.innerHTML = detailView.render();
             detailView.bindEvents();
         } catch (error) {
             this.showError('Failed to load device details: ' + error.message);
         }
     }
-    
+
     showError(message) {
         this.mainContent.innerHTML = `
             <div class="error">
@@ -117,7 +152,7 @@ class App {
             </div>
         `;
     }
-    
+
     showSearchField() {
         const searchContainer = document.getElementById('search-container');
         if (searchContainer) {
@@ -130,15 +165,10 @@ class App {
         if (searchContainer) {
             searchContainer.style.display = 'none';
 
-            // Clear search when hiding
             const searchInput = document.getElementById('device-search');
             const clearButton = document.getElementById('clear-search');
-            if (searchInput) {
-                searchInput.value = '';
-            }
-            if (clearButton) {
-                clearButton.style.display = 'none';
-            }
+            if (searchInput) searchInput.value = '';
+            if (clearButton) clearButton.style.display = 'none';
         }
     }
 

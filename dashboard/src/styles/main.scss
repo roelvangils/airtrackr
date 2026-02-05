@@ -1031,6 +1031,163 @@ body {
   }
 }
 
+// Export Buttons
+.export-buttons {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+
+  .export-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background-color: var(--secondary-system-grouped-background);
+    color: var(--primary-blue);
+    text-decoration: none;
+    border-radius: 12px;
+    font-size: 15px;
+    font-weight: 600;
+    border: 1px solid var(--separator);
+    transition: all 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+    cursor: pointer;
+    font-family: $sf-font-stack;
+
+    &:hover {
+      background-color: rgba(10, 132, 255, 0.1);
+      border-color: var(--primary-blue);
+      transform: translateY(-1px);
+    }
+
+    &:active {
+      transform: scale(0.96);
+    }
+  }
+}
+
+// Date Filter
+.date-filter {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding: 16px;
+  background-color: var(--secondary-system-grouped-background);
+  border-radius: 12px;
+  border: 0.5px solid var(--separator);
+  flex-wrap: wrap;
+
+  .date-filter-inputs {
+    display: flex;
+    gap: 12px;
+    flex: 1;
+    min-width: 200px;
+
+    label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+
+      span {
+        font-size: 14px;
+        font-weight: 500;
+        color: var(--label-secondary);
+        min-width: 35px;
+      }
+
+      input[type="date"] {
+        flex: 1;
+        padding: 8px 12px;
+        border: 1px solid var(--separator);
+        border-radius: 8px;
+        font-size: 14px;
+        background-color: var(--tertiary-system-fill);
+        color: var(--label-primary);
+        font-family: $sf-font-stack;
+
+        &:focus {
+          outline: none;
+          border-color: var(--primary-blue);
+        }
+      }
+    }
+  }
+
+  .date-filter-actions {
+    display: flex;
+    gap: 8px;
+
+    .date-filter-btn {
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      font-family: $sf-font-stack;
+      transition: all 0.2s ease;
+
+      &.apply-date-filter {
+        background-color: var(--primary-blue);
+        color: white;
+
+        &:hover {
+          opacity: 0.85;
+        }
+      }
+
+      &.clear-date-filter {
+        background-color: var(--secondary-system-fill);
+        color: var(--label-primary);
+
+        &:hover {
+          background-color: var(--tertiary-system-fill);
+        }
+      }
+    }
+  }
+}
+
+// Load More
+.load-more-container {
+  text-align: center;
+  margin: 24px 0;
+
+  .load-more-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 24px;
+    background-color: var(--secondary-system-grouped-background);
+    color: var(--primary-blue);
+    border: 1px solid var(--separator);
+    border-radius: 12px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: $sf-font-stack;
+    transition: all 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+
+    &:hover {
+      background-color: rgba(10, 132, 255, 0.1);
+      border-color: var(--primary-blue);
+      transform: translateY(-1px);
+    }
+
+    &:active {
+      transform: scale(0.96);
+    }
+  }
+}
+
+// Leaflet overrides
+.leaflet-container {
+  border-radius: 0;
+  font-family: $sf-font-stack;
+}
+
 // Map Container
 .map-container {
   margin-bottom: 24px;

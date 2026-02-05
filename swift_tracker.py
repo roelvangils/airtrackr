@@ -28,9 +28,10 @@ import logging
 import schedule
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
-from contextlib import contextmanager
+from typing import List, Dict, Optional
 from geocoding import Geocoder
+from db import get_connection, init_schema, is_duplicate, sanitize_device_data, resolve_location_alias
+from enrichment import compute_distance_from_home, update_visits, detect_trips
 
 # Configure logging
 logging.basicConfig(
@@ -47,20 +48,11 @@ class SwiftAirTagTracker:
     and manages database storage of AirTag locations.
     """
     
-    def __init__(self, db_path: str = "database/airtracker.db"):
-        """
-        Initialize the tracker with database and Swift extractor paths.
-        
-        Args:
-            db_path: Path to SQLite database file
-        """
-        self.db_path = db_path
+    def __init__(self):
+        """Initialize the tracker with Swift extractor path."""
         self.swift_extractor = Path(__file__).parent / "swift" / "airtag_extractor"
-        self.geocoder = Geocoder()  # Initialize geocoder
-        
-        # Ensure database directory exists
-        Path(db_path).parent.mkdir(exist_ok=True)
-        
+        self.geocoder = Geocoder()
+
         # The binary MUST be pre-compiled as part of the deployment process.
         if not self.swift_extractor.exists() or not os.access(self.swift_extractor, os.X_OK):
             error_msg = (
@@ -69,91 +61,10 @@ class SwiftAirTagTracker:
             )
             logger.error(error_msg)
             raise FileNotFoundError(error_msg)
-        
-        # Initialize database schema
-        self._init_database()
-        logger.info(f"Initialized tracker with database: {self.db_path}")
-    
-    def _init_database(self):
-        """
-        Initialize the database schema for storing AirTag locations.
-        Creates tables and indexes if they don't exist.
-        """
-        with self._get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Create swift_locations table for raw location data
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS swift_locations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    device_name TEXT NOT NULL,
-                    location TEXT,
-                    time_status TEXT,
-                    distance TEXT,
-                    latitude REAL,
-                    longitude REAL,
-                    raw_data TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    extracted_at TIMESTAMP  -- From Swift extractor
-                )
-            ''')
-            
-            # Check if extracted_at column exists, add if missing
-            cursor.execute("PRAGMA table_info(swift_locations)")
-            columns = [row[1] for row in cursor.fetchall()]
-            if 'extracted_at' not in columns:
-                cursor.execute('ALTER TABLE swift_locations ADD COLUMN extracted_at TIMESTAMP')
-                logger.info("Added extracted_at column to swift_locations table")
-            
-            # Create devices summary table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS swift_devices (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    device_name TEXT UNIQUE NOT NULL,
-                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_location TEXT,
-                    update_count INTEGER DEFAULT 0
-                )
-            ''')
-            
-            # Create indexes for performance
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_swift_locations_device_name 
-                ON swift_locations(device_name)
-            ''')
-            
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_swift_locations_timestamp 
-                ON swift_locations(timestamp DESC)
-            ''')
-            
-            # Create extracted_at index if needed
-            if 'extracted_at' not in columns:
-                logger.info("Upgrading schema: Adding 'extracted_at' column to swift_locations.")
-                cursor.execute('''
-                    CREATE INDEX IF NOT EXISTS idx_swift_locations_extracted_at 
-                    ON swift_locations(extracted_at)
-                ''')
-            
-            conn.commit()
-            logger.debug("Database schema initialized")
-    
-    
-    @contextmanager
-    def _get_db_connection(self):
-        """
-        Context manager for database connections with automatic cleanup.
-        
-        Yields:
-            sqlite3.Connection: Database connection
-        """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row  # Enable column access by name
-        try:
-            yield conn
-        finally:
-            conn.close()
+
+        # Initialize database schema via shared module
+        init_schema()
+        logger.info("Initialized tracker")
     
     def extract_locations(self, retry_count: int = 3) -> List[Dict]:
         """
@@ -210,57 +121,90 @@ class SwiftAirTagTracker:
     def save_locations(self, devices: List[Dict]) -> int:
         """
         Save extracted device locations to the database.
-        
+
         Args:
             devices: List of device dictionaries from Swift extractor
-            
+
         Returns:
             Number of records saved
         """
         if not devices:
             return 0
-        
+
         saved_count = 0
-        
-        with self._get_db_connection() as conn:
+
+        with get_connection() as conn:
             try:
                 cursor = conn.cursor()
-                
+
                 for device_data in devices:
+                    # Sanitize: fix decimal-distance parsing, time-in-location,
+                    # and skip "No location found" noise
+                    cleaned = sanitize_device_data(dict(device_data))
+                    if cleaned is None:
+                        logger.debug(f"Skipping {device_data['name']}: no usable location")
+                        continue
+
                     # Parse extracted_at timestamp from ISO format
-                    extracted_at = device_data.get('extractedAt', '')
+                    extracted_at = cleaned.get('extractedAt', '')
                     if extracted_at:
-                        # Convert ISO 8601 to SQLite timestamp
                         extracted_at = extracted_at.replace('T', ' ').replace('Z', '')
-                    
-                    # Geocode the location if it's not "No location found"
-                    location_text = device_data['location']
+
+                    device_name = cleaned['name']
+                    location_text = cleaned['location']
+
+                    # Skip duplicates within 2-minute window
+                    if is_duplicate(conn, device_name, location_text):
+                        logger.debug(f"Skipping duplicate: {device_name} at {location_text}")
+                        continue
+
+                    # Resolve alias (e.g. "Home" → "Onderstraat 7, 9000 Ghent")
+                    geocode_text = resolve_location_alias(location_text)
+
+                    # Geocode the resolved address
                     latitude, longitude = None, None
-                    
-                    if location_text and location_text != "No location found":
+                    try:
+                        latitude, longitude = self.geocoder.geocode(geocode_text)
+                        if latitude and longitude:
+                            logger.debug(f"Geocoded {location_text} -> ({latitude:.6f}, {longitude:.6f})")
+                    except Exception as e:
+                        logger.warning(f"Geocoding failed for '{geocode_text}': {e}")
+
+                    # Computed timestamp from relative time (e.g. "15 min ago" → absolute)
+                    location_timestamp = cleaned.get('location_timestamp')
+
+                    # Distance from home
+                    dist_home = None
+                    if latitude is not None and longitude is not None:
                         try:
-                            latitude, longitude = self.geocoder.geocode(location_text)
-                            if latitude and longitude:
-                                logger.debug(f"Geocoded {location_text} -> ({latitude:.6f}, {longitude:.6f})")
+                            dist_home = compute_distance_from_home(latitude, longitude)
                         except Exception as e:
-                            logger.warning(f"Geocoding failed for '{location_text}': {e}")
-                    
+                            logger.debug(f"Could not compute distance from home: {e}")
+
+                    # Battery status (from Swift extractor, may be None)
+                    battery_status = cleaned.get('batteryStatus')
+
                     # Insert location record
                     cursor.execute('''
-                        INSERT INTO swift_locations 
-                        (device_name, location, time_status, distance, latitude, longitude, raw_data, extracted_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO swift_locations
+                        (device_name, location, time_status, distance, latitude, longitude,
+                         raw_data, extracted_at, location_timestamp,
+                         distance_from_home_km, battery_status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        device_data['name'],
-                        device_data['location'],
-                        device_data['timeStatus'],
-                        device_data['distance'],
+                        device_name,
+                        location_text,
+                        cleaned['timeStatus'],
+                        cleaned['distance'],
                         latitude,
                         longitude,
-                        json.dumps(device_data),
-                        extracted_at
+                        json.dumps(device_data),  # Store original raw data for debugging
+                        extracted_at,
+                        location_timestamp,
+                        dist_home,
+                        battery_status,
                     ))
-                    
+
                     # Update or insert device summary
                     cursor.execute('''
                         INSERT INTO swift_devices (device_name, last_location, update_count)
@@ -270,24 +214,27 @@ class SwiftAirTagTracker:
                             last_location = excluded.last_location,
                             update_count = update_count + 1
                     ''', (
-                        device_data['name'],
-                        device_data['location']
+                        device_name,
+                        location_text
                     ))
-                    
+
                     saved_count += 1
-                
-                conn.commit()  # Commit once after all records are processed
+
+                    # Track visit (dwell time)
+                    ts = location_timestamp or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    try:
+                        update_visits(device_name, location_text, latitude, longitude, ts)
+                    except Exception as e:
+                        logger.debug(f"Visit tracking failed for {device_name}: {e}")
+
+                conn.commit()
                 logger.info(f"Saved {saved_count}/{len(devices)} location updates")
-                
-            except sqlite3.Error as e:
-                logger.error(f"Database error during batch insert, rolling back: {e}")
-                conn.rollback()
-                return 0  # Indicate failure
+
             except Exception as e:
-                logger.error(f"An unexpected error occurred, rolling back: {e}")
+                logger.error(f"Error saving locations: {e}")
                 conn.rollback()
-                return 0  # Indicate failure
-                
+                return 0
+
         return saved_count
     
     def track_once(self) -> bool:
@@ -314,6 +261,16 @@ class SwiftAirTagTracker:
         
         # Save to database
         saved = self.save_locations(devices)
+
+        # Detect trips for each device
+        if saved > 0:
+            device_names = {d['name'] for d in devices}
+            for name in device_names:
+                try:
+                    detect_trips(name, since_minutes=10)
+                except Exception as e:
+                    logger.debug(f"Trip detection failed for {name}: {e}")
+
         return saved > 0
     
     def get_recent_locations(self, limit: int = 20, device_name: Optional[str] = None) -> List[sqlite3.Row]:
@@ -327,7 +284,7 @@ class SwiftAirTagTracker:
         Returns:
             List of location records
         """
-        with self._get_db_connection() as conn:
+        with get_connection() as conn:
             cursor = conn.cursor()
             
             if device_name:
@@ -355,7 +312,7 @@ class SwiftAirTagTracker:
         Returns:
             List of device summary records
         """
-        with self._get_db_connection() as conn:
+        with get_connection() as conn:
             cursor = conn.cursor()
             
             cursor.execute('''
@@ -384,7 +341,7 @@ class SwiftAirTagTracker:
         """
         cutoff_date = datetime.now() - timedelta(days=days_to_keep)
         
-        with self._get_db_connection() as conn:
+        with get_connection() as conn:
             cursor = conn.cursor()
             
             cursor.execute('''
@@ -432,11 +389,6 @@ def main():
         description="Track AirTag locations using Find My accessibility API"
     )
     parser.add_argument(
-        '--database', '-d',
-        default='database/airtracker.db',
-        help='Path to SQLite database (default: database/airtracker.db)'
-    )
-    parser.add_argument(
         '--schedule', '-s',
         type=int,
         metavar='MINUTES',
@@ -468,12 +420,12 @@ def main():
         default=20,
         help='Limit number of history records (default: 20)'
     )
-    
+
     args = parser.parse_args()
-    
+
     # Initialize tracker
     try:
-        tracker = SwiftAirTagTracker(args.database)
+        tracker = SwiftAirTagTracker()
     except FileNotFoundError as e:
         print(f"Error: {e}")
         sys.exit(1)
