@@ -132,12 +132,13 @@ class App {
             // Decode the device name from the URL parameter
             const deviceName = decodeURIComponent(deviceId);
 
-            const [device, locations] = await Promise.all([
+            const [device, locations, stats] = await Promise.all([
                 this.apiService.getDevice(deviceName),
-                this.apiService.getDeviceLocations(deviceName)
+                this.apiService.getDeviceLocations(deviceName),
+                this.apiService.getDeviceStatsSummary(deviceName).catch(() => null),
             ]);
 
-            const detailView = new DeviceDetailView(device, locations.locations, locations.total, this.router, this.apiService);
+            const detailView = new DeviceDetailView(device, locations.locations, locations.total, this.router, this.apiService, stats);
             this.mainContent.innerHTML = detailView.render();
             detailView.bindEvents();
         } catch (error) {

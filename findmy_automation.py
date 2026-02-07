@@ -5,10 +5,8 @@ Find My Tab Automation Module
 This module handles automatic tab switching in the Find My app
 to enable comprehensive tracking of People, Devices, and Items.
 
-Uses AppleScript to send keyboard shortcuts to Find My app:
-- Cmd+1: People tab
-- Cmd+2: Devices tab
-- Cmd+3: Items tab
+Uses AppleScript menu clicks (View → People/Devices/Items) because
+keyboard shortcuts (Cmd+1/2/3) are unreliable on headless Macs.
 """
 
 import subprocess
@@ -24,11 +22,11 @@ logger = logging.getLogger(__name__)
 class FindMyAutomation:
     """Automates tab switching in the Find My app."""
 
-    # Keyboard shortcuts for Find My tabs
-    TAB_SHORTCUTS = {
-        'person': '1',  # Cmd+1 for People
-        'device': '2',  # Cmd+2 for Devices
-        'item': '3',    # Cmd+3 for Items
+    # Menu item names for Find My tabs (View menu)
+    TAB_MENU_ITEMS = {
+        'person': 'People',
+        'device': 'Devices',
+        'item': 'Items',
     }
 
     def __init__(self):
@@ -66,7 +64,7 @@ class FindMyAutomation:
 
     def switch_to_tab(self, device_type: DeviceType) -> bool:
         """
-        Switch to the specified tab in Find My app.
+        Switch to the specified tab in Find My app via View menu click.
 
         Args:
             device_type: The type of tab to switch to ('person', 'device', or 'item')
@@ -74,17 +72,19 @@ class FindMyAutomation:
         Returns:
             True if successful, False otherwise
         """
-        if device_type not in self.TAB_SHORTCUTS:
+        if device_type not in self.TAB_MENU_ITEMS:
             logger.error(f"Invalid device type: {device_type}")
             return False
 
-        key = self.TAB_SHORTCUTS[device_type]
+        menu_item = self.TAB_MENU_ITEMS[device_type]
 
-        # AppleScript to send Cmd+<key> to Find My
+        # AppleScript to click View → People/Devices/Items menu item
         applescript = f'''
         tell application "System Events"
             tell process "{self.app_name}"
-                keystroke "{key}" using command down
+                set frontmost to true
+                delay 0.5
+                click menu item "{menu_item}" of menu "View" of menu bar 1
             end tell
         end tell
         '''
@@ -95,9 +95,9 @@ class FindMyAutomation:
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=5
+                timeout=10
             )
-            logger.info(f"Switched to {device_type} tab (Cmd+{key})")
+            logger.info(f"Switched to {device_type} tab (View → {menu_item})")
             return True
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to switch to {device_type} tab: {e}")

@@ -6,9 +6,10 @@ This API provides REST endpoints for accessing AirTag location data
 collected by the Swift accessibility-based tracker.
 """
 
-from fastapi import FastAPI, HTTPException, Query, Path as PathParam, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, Path as PathParam, BackgroundTasks, Security, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
@@ -18,9 +19,32 @@ import json
 import csv
 import io
 import re
+import os
 
 from db import get_connection, init_schema, DB_PATH
 from enrichment import haversine_km
+
+# ─── API Key Authentication ───
+
+def _load_api_key() -> Optional[str]:
+    """Load API key from AIRTRACKR_API_KEY env var or .api_key file."""
+    key = os.environ.get("AIRTRACKR_API_KEY")
+    if key:
+        return key.strip()
+    key_file = Path(__file__).parent / ".api_key"
+    if key_file.exists():
+        return key_file.read_text().strip()
+    return None
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def require_api_key(api_key: Optional[str] = Security(_api_key_header)):
+    """Dependency that enforces API key authentication."""
+    expected = _load_api_key()
+    if expected is None:
+        return  # No .api_key file = auth disabled (development mode)
+    if not api_key or api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 # Ensure schema is up to date on startup
 init_schema()
@@ -31,16 +55,21 @@ app = FastAPI(
     description="REST API for Swift-based AirTag location tracking",
     version="3.0.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    dependencies=[Depends(require_api_key)],
 )
 
-# CORS middleware for web frontends
+# CORS middleware — restrict to known dashboard origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://192.168.50.6:3000",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
 # ─── Pydantic models ───
@@ -59,6 +88,11 @@ class DeviceLocation(BaseModel):
     extracted_at: Optional[datetime]
     distance_from_home_km: Optional[float] = None
     battery_status: Optional[str] = None
+    street: Optional[str] = None
+    house_number: Optional[str] = None
+    postal_code: Optional[str] = None
+    city: Optional[str] = None
+    country: Optional[str] = None
 
 class Device(BaseModel):
     """Device summary information"""
@@ -169,6 +203,24 @@ class StructuredAddress(BaseModel):
     postal_code: Optional[str] = None
     city: Optional[str] = None
     country: Optional[str] = None
+
+class DeviceStatsSummary(BaseModel):
+    """Summary statistics for a device"""
+    device_name: str
+    total_records: int
+    first_seen: Optional[datetime]
+    last_seen: Optional[datetime]
+    days_tracked: int
+    avg_updates_per_day: float
+    unique_locations: int
+    top_locations: List[Dict[str, Any]]
+    home_record_count: int
+    home_percentage: Optional[float]
+    records_with_coords: int
+    total_distance_km: Optional[float]
+    furthest_from_home_km: Optional[float]
+    furthest_location: Optional[str]
+
 
 # ─── Helpers ───
 
@@ -426,29 +478,33 @@ async def get_device_history(
     with get_connection() as conn:
         cursor = conn.cursor()
 
-        where_clauses = ["device_name = ?"]
+        where_clauses = ["l.device_name = ?"]
         params: list = [device_name]
 
         if start_date:
-            where_clauses.append("timestamp >= ?")
+            where_clauses.append("l.timestamp >= ?")
             params.append(start_date.isoformat())
         if end_date:
-            where_clauses.append("timestamp <= ?")
+            where_clauses.append("l.timestamp <= ?")
             params.append(end_date.isoformat())
 
         where = " AND ".join(where_clauses)
 
         # Total count for this filter
-        cursor.execute(f"SELECT COUNT(*) FROM swift_locations WHERE {where}", params)
+        cursor.execute(f"SELECT COUNT(*) FROM swift_locations l WHERE {where}", params)
         total = cursor.fetchone()[0]
 
         cursor.execute(f"""
-            SELECT id, device_name, location, time_status, distance,
-                   latitude, longitude, device_type, timestamp, extracted_at,
-                   distance_from_home_km, battery_status
-            FROM swift_locations
+            SELECT l.id, l.device_name, l.location, l.time_status, l.distance,
+                   l.latitude, l.longitude, l.device_type, l.timestamp, l.extracted_at,
+                   l.distance_from_home_km, l.battery_status,
+                   gc.street, gc.house_number, gc.postal_code, gc.city, gc.country
+            FROM swift_locations l
+            LEFT JOIN geocoding_cache gc
+              ON ROUND(l.latitude, 4) = ROUND(gc.latitude, 4)
+              AND ROUND(l.longitude, 4) = ROUND(gc.longitude, 4)
             WHERE {where}
-            ORDER BY timestamp DESC
+            ORDER BY l.timestamp DESC
             LIMIT ? OFFSET ?
         """, params + [limit, offset])
 
@@ -642,6 +698,113 @@ async def check_device_zone(
     return ZoneCheck(device_name=device_name, in_zone=False)
 
 
+@v1.get("/devices/{device_name}/stats-summary", response_model=DeviceStatsSummary, tags=["Devices"])
+async def get_device_stats_summary(
+    device_name: str = PathParam(..., description="Device name"),
+):
+    """Get summary statistics for a device"""
+    from enrichment import get_home_coordinates
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+
+        # Query 1: Basic counts
+        cursor.execute("""
+            SELECT COUNT(*) as total_records,
+                   MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
+                   CAST(julianday(MAX(timestamp)) - julianday(MIN(timestamp)) + 1 AS INTEGER) as days_tracked,
+                   COUNT(DISTINCT location) as unique_locations,
+                   COUNT(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 END) as records_with_coords,
+                   COUNT(CASE WHEN location = 'Home' THEN 1 END) as home_record_count
+            FROM swift_locations WHERE device_name = ?
+        """, (device_name,))
+        base = cursor.fetchone()
+
+        total_records = base['total_records']
+        if total_records == 0:
+            return DeviceStatsSummary(
+                device_name=device_name, total_records=0,
+                first_seen=None, last_seen=None, days_tracked=0,
+                avg_updates_per_day=0, unique_locations=0, top_locations=[],
+                home_record_count=0, home_percentage=None,
+                records_with_coords=0, total_distance_km=None,
+                furthest_from_home_km=None, furthest_location=None,
+            )
+
+        first_seen = parse_datetime(base['first_seen'])
+        last_seen = parse_datetime(base['last_seen'])
+        days_tracked = max(base['days_tracked'], 1)
+        unique_locations = base['unique_locations']
+        records_with_coords = base['records_with_coords']
+        home_record_count = base['home_record_count']
+        home_percentage = round(home_record_count / total_records * 100, 1) if total_records > 0 else None
+
+        # Query 2: Top 5 locations
+        cursor.execute("""
+            SELECT location as name, COUNT(*) as count
+            FROM swift_locations
+            WHERE device_name = ? AND location NOT IN ('No location found', 'Address Unavailable')
+            GROUP BY location ORDER BY count DESC LIMIT 5
+        """, (device_name,))
+        top_rows = cursor.fetchall()
+        top_locations = [
+            {"name": r['name'], "count": r['count'], "percentage": round(r['count'] / total_records * 100, 1)}
+            for r in top_rows
+        ]
+
+        # Query 3: Coordinates for distance calculation
+        cursor.execute("""
+            SELECT latitude, longitude, location
+            FROM swift_locations
+            WHERE device_name = ? AND latitude IS NOT NULL AND longitude IS NOT NULL
+            ORDER BY timestamp ASC
+        """, (device_name,))
+        coord_rows = cursor.fetchall()
+
+        total_distance_km = None
+        furthest_from_home_km = None
+        furthest_location = None
+
+        if len(coord_rows) >= 2:
+            dist_sum = 0.0
+            for i in range(1, len(coord_rows)):
+                dist_sum += haversine_km(
+                    coord_rows[i - 1]['latitude'], coord_rows[i - 1]['longitude'],
+                    coord_rows[i]['latitude'], coord_rows[i]['longitude'],
+                )
+            total_distance_km = round(dist_sum, 2)
+
+        home = get_home_coordinates()
+        if home and len(coord_rows) > 0:
+            max_dist = 0.0
+            max_loc = None
+            for r in coord_rows:
+                d = haversine_km(r['latitude'], r['longitude'], home[0], home[1])
+                if d > max_dist:
+                    max_dist = d
+                    max_loc = r['location']
+            if max_dist > 0.5:
+                furthest_from_home_km = round(max_dist, 2)
+                furthest_location = max_loc
+
+        return DeviceStatsSummary(
+            device_name=device_name,
+            total_records=total_records,
+            first_seen=first_seen,
+            last_seen=last_seen,
+            days_tracked=days_tracked,
+            avg_updates_per_day=round(total_records / days_tracked, 2),
+            unique_locations=unique_locations,
+            top_locations=top_locations,
+            home_record_count=home_record_count,
+            home_percentage=home_percentage,
+            records_with_coords=records_with_coords,
+            total_distance_km=total_distance_km,
+            furthest_from_home_km=furthest_from_home_km,
+            furthest_location=furthest_location,
+        )
+
+
 # ─── Locations ───
 
 @v1.get("/locations/latest", response_model=List[DeviceLocation], tags=["Locations"])
@@ -652,12 +815,16 @@ async def get_latest_locations():
         cursor.execute("""
             SELECT l.id, l.device_name, l.location, l.time_status, l.distance,
                    l.latitude, l.longitude, l.device_type, l.timestamp, l.extracted_at,
-                   l.distance_from_home_km, l.battery_status
+                   l.distance_from_home_km, l.battery_status,
+                   gc.street, gc.house_number, gc.postal_code, gc.city, gc.country
             FROM swift_locations l
             INNER JOIN (
                 SELECT device_name, MAX(timestamp) as max_timestamp
                 FROM swift_locations GROUP BY device_name
             ) latest ON l.device_name = latest.device_name AND l.timestamp = latest.max_timestamp
+            LEFT JOIN geocoding_cache gc
+              ON ROUND(l.latitude, 4) = ROUND(gc.latitude, 4)
+              AND ROUND(l.longitude, 4) = ROUND(gc.longitude, 4)
             ORDER BY l.device_name
         """)
         return [_parse_location_row(row) for row in cursor.fetchall()]

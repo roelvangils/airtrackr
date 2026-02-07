@@ -21,6 +21,10 @@
             }
         }
     },
+    "contacts": {
+        "enabled": true,
+        "sync_interval_seconds": 3600
+    },
     "database": {
         "backup_enabled": true,
         "backup_interval_hours": 24,

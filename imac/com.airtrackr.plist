@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    AirTrackr — Tracker LaunchAgent (BACKUP ONLY)
+
+    NOTE: The tracker requires Terminal.app for Accessibility permissions.
+    Primary startup is via AirTrackr.command (Login Item).
+    This plist is kept as a backup but should NOT be loaded simultaneously.
+    Use com.airtrackr.api.plist for the API server instead.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -16,8 +24,8 @@
     <key>ThrottleInterval</key>
     <integer>30</integer>
     <key>StandardOutPath</key>
-    <string>/Users/evelyn/Desktop/airtrackr_errors.log</string>
+    <string>/Users/evelyn/Repos/airtrackr/logs/tracker_launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/evelyn/Desktop/airtrackr_errors.log</string>
+    <string>/Users/evelyn/Repos/airtrackr/logs/tracker_launchd_stderr.log</string>
 </dict>
 </plist>

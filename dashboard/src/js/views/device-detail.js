@@ -1,10 +1,11 @@
 export class DeviceDetailView {
-    constructor(device, locations, total, router, apiService) {
+    constructor(device, locations, total, router, apiService, stats = null) {
         this.device = device;
         this.locations = locations;
         this.total = total;
         this.router = router;
         this.apiService = apiService;
+        this.stats = stats;
         this.offset = locations.length;
         this.limit = 50;
         this.startDate = null;
@@ -30,6 +31,7 @@ export class DeviceDetailView {
                 ${this.renderExportButtons()}
                 ${this.renderDateFilter()}
                 ${this.renderMap()}
+                ${this.renderStats()}
                 ${this.renderTimeline()}
                 ${this.renderLoadMore()}
                 ${this.renderDangerZone()}
@@ -171,6 +173,132 @@ export class DeviceDetailView {
         }
     }
 
+    renderStats() {
+        if (!this.stats || this.stats.total_records === 0) return '';
+
+        const s = this.stats;
+
+        const formatDate = (iso) => {
+            if (!iso) return '—';
+            return new Date(iso).toLocaleDateString();
+        };
+
+        const dateRange = `${formatDate(s.first_seen)} – ${formatDate(s.last_seen)}`;
+
+        const cards = [];
+
+        // Tracking Period
+        cards.push(`
+            <div class="stats-card">
+                <div class="stats-card-icon"><i class="fa-solid fa-calendar-days"></i></div>
+                <div class="stats-card-body">
+                    <div class="stats-card-value">${s.days_tracked} day${s.days_tracked !== 1 ? 's' : ''}</div>
+                    <div class="stats-card-label">Tracking Period</div>
+                    <div class="stats-card-detail">${dateRange}</div>
+                </div>
+            </div>
+        `);
+
+        // Total Updates
+        cards.push(`
+            <div class="stats-card">
+                <div class="stats-card-icon"><i class="fa-solid fa-arrow-rotate-right"></i></div>
+                <div class="stats-card-body">
+                    <div class="stats-card-value">${s.total_records.toLocaleString()}</div>
+                    <div class="stats-card-label">Total Updates</div>
+                    <div class="stats-card-detail">${s.avg_updates_per_day} per day</div>
+                </div>
+            </div>
+        `);
+
+        // Unique Locations
+        cards.push(`
+            <div class="stats-card">
+                <div class="stats-card-icon"><i class="fa-solid fa-location-dot"></i></div>
+                <div class="stats-card-body">
+                    <div class="stats-card-value">${s.unique_locations}</div>
+                    <div class="stats-card-label">Unique Locations</div>
+                    <div class="stats-card-detail">${s.records_with_coords} with coordinates</div>
+                </div>
+            </div>
+        `);
+
+        // Total Distance
+        if (s.total_distance_km !== null && s.total_distance_km > 0) {
+            cards.push(`
+                <div class="stats-card">
+                    <div class="stats-card-icon"><i class="fa-solid fa-road"></i></div>
+                    <div class="stats-card-body">
+                        <div class="stats-card-value">${s.total_distance_km.toLocaleString()} km</div>
+                        <div class="stats-card-label">Total Distance</div>
+                        <div class="stats-card-detail">Between consecutive readings</div>
+                    </div>
+                </div>
+            `);
+        }
+
+        // Time at Home
+        if (s.home_percentage !== null) {
+            cards.push(`
+                <div class="stats-card">
+                    <div class="stats-card-icon"><i class="fa-solid fa-house"></i></div>
+                    <div class="stats-card-body">
+                        <div class="stats-card-value">${s.home_percentage}%</div>
+                        <div class="stats-card-label">Time at Home</div>
+                        <div class="stats-card-detail">${s.home_record_count} of ${s.total_records} readings</div>
+                    </div>
+                </div>
+            `);
+        }
+
+        // Furthest from Home
+        if (s.furthest_from_home_km !== null && s.furthest_from_home_km > 0.5) {
+            cards.push(`
+                <div class="stats-card">
+                    <div class="stats-card-icon"><i class="fa-solid fa-arrows-left-right-to-line"></i></div>
+                    <div class="stats-card-body">
+                        <div class="stats-card-value">${s.furthest_from_home_km} km</div>
+                        <div class="stats-card-label">Furthest from Home</div>
+                        <div class="stats-card-detail">${this.escapeHtml(s.furthest_location || '')}</div>
+                    </div>
+                </div>
+            `);
+        }
+
+        // Top Locations
+        let topLocationsHtml = '';
+        if (s.top_locations && s.top_locations.length > 0) {
+            const rows = s.top_locations.map((loc, i) => `
+                <div class="stats-location-row">
+                    <span class="stats-location-rank">${i + 1}</span>
+                    <div class="stats-location-info">
+                        <div class="stats-location-name">${this.escapeHtml(loc.name)}</div>
+                        <div class="stats-location-bar-track">
+                            <div class="stats-location-bar" style="width: ${loc.percentage}%"></div>
+                        </div>
+                    </div>
+                    <span class="stats-location-count">${loc.count}x (${loc.percentage}%)</span>
+                </div>
+            `).join('');
+
+            topLocationsHtml = `
+                <div class="stats-top-locations">
+                    <h4><i class="fa-solid fa-ranking-star"></i> Top Locations</h4>
+                    ${rows}
+                </div>
+            `;
+        }
+
+        return `
+            <div class="stats-summary">
+                <div class="stats-grid">
+                    ${cards.join('')}
+                </div>
+                ${topLocationsHtml}
+            </div>
+        `;
+    }
+
     renderTimeline() {
         if (!this.locations || this.locations.length === 0) {
             return `
@@ -298,11 +426,21 @@ export class DeviceDetailView {
             const startFormatted = startDate.toLocaleString();
             const endFormatted = endDate.toLocaleString();
 
+            // Get structured address and enrichment from the first location in the group
+            const firstLoc = group.locations[0];
+            const addressLine = this.formatStructuredAddress(firstLoc);
+            const distHomeBadge = this.formatDistanceHomeBadge(firstLoc);
+            const batteryBadge = this.formatBatteryBadge(firstLoc);
+
             return `
                 <div class="timeline-item timeline-group">
                     <div class="timeline-content">
                         <div class="timeline-location">
                             ${this.escapeHtml(group.cleanLocation)}
+                        </div>
+                        ${addressLine ? `<div class="timeline-address">${this.escapeHtml(addressLine)}</div>` : ''}
+                        <div class="timeline-badges">
+                            ${distHomeBadge}${batteryBadge}
                         </div>
                         <div class="timeline-duration">
                             From ${endFormatted} to ${startFormatted} (${duration})
@@ -368,6 +506,9 @@ export class DeviceDetailView {
         const timeAgo = this.getTimeAgo(date);
         const fullDate = date.toLocaleString();
         const cleanLocation = this.processLocationText(location.location || location.location_text);
+        const addressLine = this.formatStructuredAddress(location);
+        const distHomeBadge = this.formatDistanceHomeBadge(location);
+        const batteryBadge = this.formatBatteryBadge(location);
 
         return `
             <div class="timeline-item">
@@ -377,6 +518,10 @@ export class DeviceDetailView {
                     </div>
                     <div class="timeline-location">
                         ${this.escapeHtml(cleanLocation)}
+                    </div>
+                    ${addressLine ? `<div class="timeline-address">${this.escapeHtml(addressLine)}</div>` : ''}
+                    <div class="timeline-badges">
+                        ${distHomeBadge}${batteryBadge}
                     </div>
                     ${location.latitude && location.longitude ? `
                         <div class="timeline-coords">
@@ -740,6 +885,56 @@ export class DeviceDetailView {
         if (diffHours < 24) return `${diffHours} hour${diffHours !== 1 ? 's' : ''} ago`;
         if (diffDays < 7) return `${diffDays} day${diffDays !== 1 ? 's' : ''} ago`;
         return date.toLocaleDateString();
+    }
+
+    formatStructuredAddress(location) {
+        const parts = [];
+        if (location.street) {
+            let street = location.street;
+            if (location.house_number) street += ` ${location.house_number}`;
+            parts.push(street);
+        }
+        if (location.postal_code || location.city) {
+            const cityPart = [location.postal_code, location.city].filter(Boolean).join(' ');
+            parts.push(cityPart);
+        }
+        return parts.length > 0 ? parts.join(', ') : '';
+    }
+
+    formatDistanceHomeBadge(location) {
+        if (location.distance_from_home_km === null || location.distance_from_home_km === undefined) {
+            return '';
+        }
+        const km = location.distance_from_home_km;
+        let formatted;
+        if (km < 0.1) {
+            formatted = 'Home';
+        } else if (km < 1) {
+            formatted = `${Math.round(km * 1000)}m`;
+        } else {
+            formatted = `${km.toFixed(1)}km`;
+        }
+        return `<span class="distance-home-badge"><i class="fa-solid fa-house"></i> ${formatted}</span>`;
+    }
+
+    formatBatteryBadge(location) {
+        if (!location.battery_status) return '';
+        const status = location.battery_status.toLowerCase();
+        let icon, colorClass;
+        if (status === 'normal' || status === 'full') {
+            icon = 'fa-battery-full';
+            colorClass = 'battery-normal';
+        } else if (status === 'low') {
+            icon = 'fa-battery-quarter';
+            colorClass = 'battery-low';
+        } else if (status === 'critical') {
+            icon = 'fa-battery-empty';
+            colorClass = 'battery-critical';
+        } else {
+            icon = 'fa-battery-half';
+            colorClass = 'battery-normal';
+        }
+        return `<span class="battery-badge ${colorClass}"><i class="fa-solid ${icon}"></i> ${this.escapeHtml(location.battery_status)}</span>`;
     }
 
     escapeHtml(text) {

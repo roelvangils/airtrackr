@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path("database/airtracker.db")
 
 # Current schema version — bump this when adding migrations
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 @contextmanager
@@ -45,7 +45,7 @@ def get_connection(db_path: Optional[Path] = None):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=15000")
     try:
         yield conn
     finally:
@@ -70,6 +70,9 @@ def init_schema():
 
         if current_version < 3:
             _migrate_to_v3(conn)
+
+        if current_version < 4:
+            _migrate_to_v4(conn)
 
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
@@ -313,6 +316,27 @@ def _migrate_to_v3(conn: sqlite3.Connection):
     logger.info("Migrated database to schema v3")
 
 
+def _migrate_to_v4(conn: sqlite3.Connection):
+    """
+    Migration to v4:
+    - Drop contacts and contact_addresses tables if they exist
+    - Clean up any 'contact' device_type records
+    """
+    cursor = conn.cursor()
+
+    # Drop contacts tables
+    cursor.execute('DROP TABLE IF EXISTS contact_addresses')
+    cursor.execute('DROP TABLE IF EXISTS contacts')
+
+    # Remove any contact-type records from device tables
+    cursor.execute("DELETE FROM swift_locations WHERE device_type = 'contact'")
+    cursor.execute("DELETE FROM swift_devices WHERE device_type = 'contact'")
+
+    conn.commit()
+    logger.info("Migrated database to schema v4")
+
+
+
 def _import_geocoding_cache(conn: sqlite3.Connection):
     """Import data from the separate geocoding_cache.db if it exists."""
     cache_db_path = Path("database/geocoding_cache.db")
@@ -387,6 +411,12 @@ _TIME_VALUE_RE = re.compile(
 )
 _DISTANCE_NUM_RE = re.compile(r'^\d+\s+(km|m)$')
 
+# Stale time statuses — hours, days, weeks, months old = no real location update
+_STALE_TIME_RE = re.compile(
+    r'^(\d+)\s+(hr|hours?|days?|weeks?|mo)\s+ago$|^Yesterday$|^Last\s+(week|mo)$',
+    re.IGNORECASE,
+)
+
 # Patterns for converting relative time to absolute timestamps.
 # Uses relativedelta for months so "10 mo ago" on Feb 5 gives Apr 5, not a 300-day guess.
 _RELATIVE_TIME_RULES_TD = [
@@ -458,6 +488,15 @@ def sanitize_device_data(device_data: Dict) -> Optional[Dict]:
     if location == 'No location found' or location == 'Unknown':
         return None
 
+    # "Paused" means location sharing is not actively refreshing, but the
+    # last known location is still valid.  Only skip if there is no location.
+    if time_status == 'Paused' and (not location or location == 'No location found'):
+        return None
+
+    # Skip stale records — old cached data, not a real location update
+    if _STALE_TIME_RE.match(time_status):
+        return None
+
     # Bug 1: Decimal-distance parsing bug.
     # When timeStatus is a bare number (e.g. "0") and distance looks like "8 km",
     # the actual distance was "0,8 km" and the real time status is hiding at the
@@ -506,31 +545,69 @@ def sanitize_device_data(device_data: Dict) -> Optional[Dict]:
     return device_data
 
 
+def resolve_device_alias(device_name: str) -> str:
+    """
+    Resolve a device alias (like a phone number) to its canonical name.
+
+    Find My sometimes shows phone numbers instead of contact names.
+    The device_aliases table maps these to the correct name.
+
+    Returns the original name if no alias is found.
+    """
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                'SELECT canonical_name FROM device_aliases WHERE alias = ?',
+                (device_name,),
+            ).fetchone()
+            if row:
+                return row[0]
+    except Exception:
+        pass
+    return device_name
+
+
 def is_duplicate(
     conn: sqlite3.Connection,
     device_name: str,
     location: str,
-    window_minutes: int = 2,
+    heartbeat_minutes: int = 60,
 ) -> bool:
     """
-    Check if an identical location record exists within the given time window.
+    Skip saving if the device is still at the same location.
+
+    Only saves a new record when:
+    - The location has CHANGED from the last known location, OR
+    - At least heartbeat_minutes have passed (hourly heartbeat to confirm presence)
 
     Args:
         conn: Active database connection
         device_name: Device name to check
         location: Location text to check
-        window_minutes: Time window in minutes (default 2)
+        heartbeat_minutes: Max time between records at same location (default 60)
 
     Returns:
-        True if a duplicate exists within the window
+        True if the record should be skipped (duplicate)
     """
-    cutoff = (datetime.now() - timedelta(minutes=window_minutes)).isoformat()
-    cursor = conn.execute(
+    row = conn.execute(
         '''
-        SELECT 1 FROM swift_locations
-        WHERE device_name = ? AND location = ? AND timestamp > ?
+        SELECT location, timestamp FROM swift_locations
+        WHERE device_name = ?
+        ORDER BY timestamp DESC
         LIMIT 1
         ''',
-        (device_name, location, cutoff),
-    )
-    return cursor.fetchone() is not None
+        (device_name,),
+    ).fetchone()
+
+    if row is None:
+        return False  # First record for this device — always save
+
+    last_location, last_timestamp = row
+
+    # Location changed — always save
+    if last_location != location:
+        return False
+
+    # Same location — only save if heartbeat interval has passed
+    cutoff = (datetime.now() - timedelta(minutes=heartbeat_minutes)).isoformat()
+    return last_timestamp > cutoff

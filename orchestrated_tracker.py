@@ -27,7 +27,7 @@ from typing import List, Dict, Optional
 
 from findmy_automation import FindMyAutomation, DeviceType
 from geocoding import Geocoder
-from db import get_connection, init_schema, is_duplicate, sanitize_device_data, resolve_location_alias
+from db import get_connection, init_schema, is_duplicate, sanitize_device_data, resolve_location_alias, resolve_device_alias
 from enrichment import compute_distance_from_home, update_visits, detect_trips
 
 # Configure logging with DEBUG level for verbose output
@@ -55,8 +55,12 @@ class OrchestratedAirTagTracker:
 
     # Timing configuration (in seconds)
     INITIAL_PAUSE = 5      # Initial pause before starting
-    TAB_LOAD_TIME = 5      # Time to wait after switching tabs
-    EXTRACT_PAUSE = 30     # Pause after extracting data
+    TAB_LOAD_TIME = {      # Per-tab wait time (Find My needs time to refresh from iCloud)
+        'person': 15,      # People tab refreshes relatively fast
+        'device': 30,      # Devices tab is much slower to fetch updated locations
+        'item': 15,        # Items (AirTags) refresh reasonably fast
+    }
+    EXTRACT_PAUSE = 15     # Pause after extracting data
     CYCLE_END_PAUSE = 60   # Pause at end of cycle before repeating
 
     def __init__(self):
@@ -127,7 +131,7 @@ class OrchestratedAirTagTracker:
         logger.error(f"Failed to extract {device_type} tab after {retry_count} attempts")
         return []
 
-    def save_locations(self, devices: List[Dict], device_type: DeviceType) -> int:
+    def save_locations(self, devices: List[Dict], device_type: DeviceType) -> tuple:
         """
         Save extracted device locations to the database.
 
@@ -136,12 +140,13 @@ class OrchestratedAirTagTracker:
             device_type: Type of entities (person, device, or item)
 
         Returns:
-            Number of records saved
+            Tuple of (number of records saved, set of resolved device names)
         """
         if not devices:
-            return 0
+            return 0, set()
 
         saved_count = 0
+        saved_device_names = set()
 
         with get_connection() as conn:
             try:
@@ -160,7 +165,7 @@ class OrchestratedAirTagTracker:
                     if extracted_at:
                         extracted_at = extracted_at.replace('T', ' ').replace('Z', '')
 
-                    device_name = cleaned['name']
+                    device_name = resolve_device_alias(cleaned['name'])
                     location_text = cleaned['location']
 
                     # Skip duplicates within 2-minute window
@@ -171,12 +176,19 @@ class OrchestratedAirTagTracker:
                     # Resolve alias (e.g. "Home" → "Onderstraat 7, 9000 Ghent")
                     geocode_text = resolve_location_alias(location_text)
 
-                    # Geocode the resolved address
+                    # Geocode the resolved address (full structured data)
                     latitude, longitude = None, None
                     try:
-                        latitude, longitude = self.geocoder.geocode(geocode_text)
-                        if latitude and longitude:
+                        geo_result = self.geocoder.geocode_full(geocode_text)
+                        if geo_result:
+                            latitude = geo_result['latitude']
+                            longitude = geo_result['longitude']
                             logger.debug(f"Geocoded {location_text} -> ({latitude:.6f}, {longitude:.6f})")
+                        else:
+                            # Fallback to simple geocode (cache-only hits without structured data)
+                            latitude, longitude = self.geocoder.geocode(geocode_text)
+                            if latitude and longitude:
+                                logger.debug(f"Geocoded (fallback) {location_text} -> ({latitude:.6f}, {longitude:.6f})")
                     except Exception as e:
                         logger.warning(f"Geocoding failed for '{geocode_text}': {e}")
 
@@ -232,13 +244,14 @@ class OrchestratedAirTagTracker:
                     ))
 
                     saved_count += 1
+                    saved_device_names.add(device_name)
 
-                    # Track visit (dwell time)
+                    # Track visit (dwell time) — reuse conn to avoid locking
                     ts = location_timestamp or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     try:
-                        update_visits(device_name, location_text, latitude, longitude, ts)
+                        update_visits(device_name, location_text, latitude, longitude, ts, conn=conn)
                     except Exception as e:
-                        logger.debug(f"Visit tracking failed for {device_name}: {e}")
+                        logger.warning(f"Visit tracking failed for {device_name}: {e}")
 
                 conn.commit()
                 logger.info(f"Saved {saved_count}/{len(devices)} {device_type} updates")
@@ -246,9 +259,9 @@ class OrchestratedAirTagTracker:
             except Exception as e:
                 logger.error(f"Error saving {device_type} tab: {e}")
                 conn.rollback()
-                return 0
+                return 0, set()
 
-        return saved_count
+        return saved_count, saved_device_names
 
     def process_tab(self, device_type: DeviceType) -> bool:
         """
@@ -278,9 +291,10 @@ class OrchestratedAirTagTracker:
             logger.error(f"Failed to switch to {tab_name} tab")
             return False
 
-        # Wait for tab to load
-        logger.info(f"Waiting {self.TAB_LOAD_TIME}s for {tab_name} tab to load...")
-        time.sleep(self.TAB_LOAD_TIME)
+        # Wait for tab to load (Devices tab needs more time than People/Items)
+        load_time = self.TAB_LOAD_TIME[device_type]
+        logger.info(f"Waiting {load_time}s for {tab_name} tab to load...")
+        time.sleep(load_time)
 
         # Extract locations
         devices = self.extract_locations_for_tab(device_type)
@@ -296,16 +310,17 @@ class OrchestratedAirTagTracker:
             logger.info(f"  - {device['name']}: {device['location']} ({status})")
 
         # Save to database
-        saved = self.save_locations(devices, device_type)
+        saved, device_names = self.save_locations(devices, device_type)
 
-        # Detect trips for each device that had new records
+        # Detect trips for each device that had new records (uses resolved names)
         if saved > 0:
-            device_names = {d['name'] for d in devices}
-            for name in device_names:
-                try:
-                    detect_trips(name, since_minutes=10)
-                except Exception as e:
-                    logger.debug(f"Trip detection failed for {name}: {e}")
+            with get_connection() as conn:
+                for name in device_names:
+                    try:
+                        detect_trips(name, since_minutes=10, conn=conn)
+                    except Exception as e:
+                        logger.warning(f"Trip detection failed for {name}: {e}")
+                conn.commit()
 
         return saved > 0
 
@@ -367,10 +382,9 @@ class OrchestratedAirTagTracker:
         logger.info("=" * 70)
         logger.info("Configuration:")
         logger.info(f"  - Initial pause: {self.INITIAL_PAUSE}s")
-        logger.info(f"  - Tab load time: {self.TAB_LOAD_TIME}s")
+        logger.info(f"  - Tab load time: People={self.TAB_LOAD_TIME['person']}s, Devices={self.TAB_LOAD_TIME['device']}s, Items={self.TAB_LOAD_TIME['item']}s")
         logger.info(f"  - Extract pause: {self.EXTRACT_PAUSE}s")
         logger.info(f"  - Cycle end pause: {self.CYCLE_END_PAUSE}s")
-        logger.info(f"  - Approximate cycle time: ~3 minutes")
         logger.info("")
         logger.info("Press Ctrl+C to stop")
         logger.info("=" * 70)
@@ -394,10 +408,9 @@ class OrchestratedAirTagTracker:
         logger.info(f"Schedule: Every {interval_minutes} minute(s)")
         logger.info("Configuration:")
         logger.info(f"  - Initial pause: {self.INITIAL_PAUSE}s")
-        logger.info(f"  - Tab load time: {self.TAB_LOAD_TIME}s")
+        logger.info(f"  - Tab load time: People={self.TAB_LOAD_TIME['person']}s, Devices={self.TAB_LOAD_TIME['device']}s, Items={self.TAB_LOAD_TIME['item']}s")
         logger.info(f"  - Extract pause: {self.EXTRACT_PAUSE}s")
         logger.info(f"  - Cycle end pause: {self.CYCLE_END_PAUSE}s")
-        logger.info(f"  - Approximate cycle time: ~3 minutes")
         logger.info("")
         logger.info("Press Ctrl+C to stop")
         logger.info("=" * 70)
