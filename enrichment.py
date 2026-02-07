@@ -109,7 +109,7 @@ def compute_distance_from_home(lat: float, lon: float) -> Optional[float]:
 TRIP_THRESHOLD_KM = 0.1  # 100 meters
 
 
-def detect_trips(device_name: str, since_minutes: int = 10) -> int:
+def detect_trips(device_name: str, since_minutes: int = 10, conn=None) -> int:
     """
     Detect trips for a device by comparing consecutive location records.
 
@@ -120,13 +120,14 @@ def detect_trips(device_name: str, since_minutes: int = 10) -> int:
     Args:
         device_name: The device to detect trips for
         since_minutes: How far back to look for new records
+        conn: Optional existing database connection to reuse (avoids locking)
 
     Returns:
         Number of trips detected
     """
     cutoff = (datetime.now() - timedelta(minutes=since_minutes)).isoformat()
 
-    with get_connection() as conn:
+    def _detect(conn, should_commit):
         cursor = conn.cursor()
 
         # Get the latest trip end_time for this device to avoid duplicates
@@ -194,10 +195,17 @@ def detect_trips(device_name: str, since_minutes: int = 10) -> int:
                 trips_detected += 1
 
         if trips_detected:
-            conn.commit()
+            if should_commit:
+                conn.commit()
             logger.info(f"Detected {trips_detected} trip(s) for {device_name}")
 
         return trips_detected
+
+    if conn is not None:
+        return _detect(conn, should_commit=False)
+    else:
+        with get_connection() as own_conn:
+            return _detect(own_conn, should_commit=True)
 
 
 # ─── Visit / Dwell Time Detection ───
@@ -208,7 +216,7 @@ VISIT_RADIUS_KM = 0.1  # 100 meters
 
 def update_visits(device_name: str, location: str,
                   lat: Optional[float], lon: Optional[float],
-                  timestamp: str) -> None:
+                  timestamp: str, conn=None) -> None:
     """
     Update visit tracking for a device.
 
@@ -221,8 +229,9 @@ def update_visits(device_name: str, location: str,
         lat: Latitude (may be None)
         lon: Longitude (may be None)
         timestamp: ISO timestamp string
+        conn: Optional existing database connection to reuse (avoids locking)
     """
-    with get_connection() as conn:
+    def _update(conn, should_commit):
         cursor = conn.cursor()
 
         # Find the most recent open visit (departure_time IS NULL)
@@ -286,4 +295,11 @@ def update_visits(device_name: str, location: str,
                 VALUES (?, ?, ?, ?, ?)
             ''', (device_name, location, lat, lon, timestamp))
 
-        conn.commit()
+        if should_commit:
+            conn.commit()
+
+    if conn is not None:
+        _update(conn, should_commit=False)
+    else:
+        with get_connection() as own_conn:
+            _update(own_conn, should_commit=True)

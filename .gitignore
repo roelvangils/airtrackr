@@ -15,6 +15,16 @@ screenshots/
 database/*.db
 database/*.sqlite
 
+# Logs
+logs/
+
+# Secrets & config with sensitive data
+.api_key
+.env
+config.json
+start_tunnels.sh
+dashboard/.env
+
 # macOS
 .DS_Store
 

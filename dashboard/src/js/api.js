@@ -18,6 +18,7 @@ export class ApiService {
             const response = await fetch(url, {
                 headers: {
                     'Content-Type': 'application/json',
+                    'X-API-Key': import.meta.env.VITE_API_KEY || '',
                     ...options.headers
                 },
                 ...options
@@ -89,6 +90,10 @@ export class ApiService {
         return this.request(`/zones/${zoneId}`, {
             method: 'DELETE'
         });
+    }
+
+    async getDeviceStatsSummary(deviceName) {
+        return this.request(`/devices/${encodeURIComponent(deviceName)}/stats-summary`);
     }
 
     getExportUrl(deviceName, format = 'csv', startDate = null, endDate = null) {

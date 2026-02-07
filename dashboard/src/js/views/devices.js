@@ -3,7 +3,6 @@ export class DevicesView {
         this.devices = devices;
         this.router = router;
         this.apiService = apiService;
-        this.userLocation = null;
     }
     
     render() {
@@ -28,22 +27,12 @@ export class DevicesView {
         // Parse timestamps - API returns UTC without timezone suffix, need to append 'Z'
         const lastSeenDate = device.last_seen ? new Date(device.last_seen + 'Z') : null;
         const firstSeenDate = device.first_seen ? new Date(device.first_seen + 'Z') : null;
-        
+
         const lastSeen = lastSeenDate ? lastSeenDate.toLocaleString() : 'Never';
         const locationCount = device.location_count || 0;
         const firstSeen = firstSeenDate ? firstSeenDate.toLocaleString() : 'Unknown';
-        
-        return `
-            <div class="device-card">
-                <div class="device-header">
-                    <div class="device-info">
-                        <div class="device-title-row">
-                            <div class="device-name">${this.escapeHtml(deviceName || 'Unknown Device')}</div>
-                            <div class="device-status ${device.last_seen ? 'active' : 'inactive'}">
-                                ${device.last_seen ? 'Active' : 'Inactive'}
-                            </div>
-                        </div>
-                        <div class="device-meta-table" data-device-id="${deviceId}">
+
+        const metaRows = `
                             <div class="meta-row">
                                 <span class="meta-label"><i class="fa-solid fa-clock"></i> Last seen</span>
                                 <span class="meta-value">${lastSeen}</span>
@@ -56,9 +45,13 @@ export class DevicesView {
                                 <span class="meta-label"><i class="fa-solid fa-list"></i> Locations</span>
                                 <span class="meta-value">${locationCount} location${locationCount !== 1 ? 's' : ''}</span>
                             </div>
-                            <div class="meta-row current-distance-row">
-                                <span class="meta-label"><i class="fa-solid fa-ruler"></i> Current distance</span>
-                                <span class="meta-value current-distance-value" data-device-id="${deviceId}">Calculating...</span>
+                            <div class="meta-row distance-home-row">
+                                <span class="meta-label"><i class="fa-solid fa-house"></i> Distance from home</span>
+                                <span class="meta-value distance-home-value" data-device-id="${deviceId}">Loading...</span>
+                            </div>
+                            <div class="meta-row battery-row" style="display:none">
+                                <span class="meta-label"><i class="fa-solid fa-battery-half"></i> Battery</span>
+                                <span class="meta-value battery-value" data-device-id="${deviceId}"></span>
                             </div>
                             ${device.latest_location ? `
                                 <div class="meta-row">
@@ -72,6 +65,20 @@ export class DevicesView {
                                     <span class="meta-value">${this.escapeHtml(device.latest_coordinates)}</span>
                                 </div>
                             ` : ''}
+        `;
+
+        return `
+            <div class="device-card">
+                <div class="device-header">
+                    <div class="device-info">
+                        <div class="device-title-row">
+                            <div class="device-name">${this.escapeHtml(deviceName || 'Unknown Device')}</div>
+                            <div class="device-status ${device.last_seen ? 'active' : 'inactive'}">
+                                ${device.last_seen ? 'Active' : 'Inactive'}
+                            </div>
+                        </div>
+                        <div class="device-meta-table" data-device-id="${deviceId}">
+                            ${metaRows}
                         </div>
                         <button class="view-history-btn" data-route="/device/${encodeURIComponent(deviceId)}">
                             View Location History
@@ -84,151 +91,92 @@ export class DevicesView {
     
     
     bindEvents() {
-        // Initialize geolocation and calculate distances
-        this.initializeGeolocation();
-        
+        // Fetch latest locations and update distance/battery for all devices
+        this.fetchAndDisplayDeviceInfo();
+
         // Initialize search functionality
         this.initializeSearch();
     }
-    
-    async initializeGeolocation() {
-        if (!navigator.geolocation) {
-            this.updateDistanceValues('Location not supported');
-            return;
-        }
-        
+
+    async fetchAndDisplayDeviceInfo() {
         try {
-            const position = await this.getCurrentPosition();
-            this.userLocation = {
-                latitude: position.coords.latitude,
-                longitude: position.coords.longitude
-            };
-            
-            // Calculate distances for all devices
-            await this.calculateAllDistances();
-            
+            const latestLocations = await this.apiService.request('/locations/latest');
+
+            // Build a lookup by device_name
+            const locationMap = {};
+            for (const loc of latestLocations) {
+                locationMap[loc.device_name] = loc;
+            }
+
+            for (const device of this.devices) {
+                const deviceId = device.device_name;
+                const latestLocation = locationMap[deviceId];
+
+                // Update distance from home
+                if (latestLocation && latestLocation.distance_from_home_km !== null && latestLocation.distance_from_home_km !== undefined) {
+                    const km = latestLocation.distance_from_home_km;
+                    const formatted = km < 0.1 ? 'Home' : km < 1 ? `${Math.round(km * 1000)}m` : `${km.toFixed(1)}km`;
+                    this.updateDistanceHomeValue(deviceId, formatted);
+                } else {
+                    this.updateDistanceHomeValue(deviceId, 'Unknown');
+                }
+
+                // Update battery status (only if available)
+                if (latestLocation && latestLocation.battery_status) {
+                    this.updateBatteryValue(deviceId, latestLocation.battery_status);
+                }
+            }
         } catch (error) {
-            console.error('Geolocation error:', error);
-            let errorMessage = 'Location unavailable';
-            
-            if (error.code === error.PERMISSION_DENIED) {
-                errorMessage = 'Location denied';
-            } else if (error.code === error.POSITION_UNAVAILABLE) {
-                errorMessage = 'Position unavailable';
-            } else if (error.code === error.TIMEOUT) {
-                errorMessage = 'Location timeout';
+            console.error('Error fetching device info:', error);
+            // Set all to unknown on error
+            for (const device of this.devices) {
+                this.updateDistanceHomeValue(device.device_name, 'Unavailable');
             }
-            
-            this.updateDistanceValues(errorMessage);
         }
     }
-    
-    getCurrentPosition() {
-        return new Promise((resolve, reject) => {
-            navigator.geolocation.getCurrentPosition(resolve, reject, {
-                enableHighAccuracy: true,
-                timeout: 10000,
-                maximumAge: 300000 // 5 minutes
-            });
-        });
-    }
-    
-    async calculateAllDistances() {
-        for (const device of this.devices) {
-            await this.calculateDeviceDistance(device);
-        }
-    }
-    
-    async calculateDeviceDistance(device) {
-        const deviceId = device.device_name;
-        
-        try {
-            // Get the latest location for this device
-            const response = await this.apiService.getDeviceLocations(deviceId, 1);
-            const locations = response.locations;
-            
-            if (!locations || locations.length === 0) {
-                this.updateDistanceValue(deviceId, 'No location data');
-                return;
-            }
-            
-            const latestLocation = locations[0];
-            
-            if (!latestLocation.latitude || !latestLocation.longitude) {
-                this.updateDistanceValue(deviceId, 'No coordinates');
-                return;
-            }
-            
-            // Calculate distance
-            const distance = this.calculateDistance(
-                this.userLocation.latitude,
-                this.userLocation.longitude,
-                latestLocation.latitude,
-                latestLocation.longitude
-            );
-            
-            this.updateDistanceValue(deviceId, this.formatDistance(distance));
-            
-        } catch (error) {
-            console.error(`Error calculating distance for device ${deviceId}:`, error);
-            this.updateDistanceValue(deviceId, 'Calculation error');
-        }
-    }
-    
-    calculateDistance(lat1, lon1, lat2, lon2) {
-        // Haversine formula to calculate distance between two points
-        const R = 6371; // Radius of the Earth in kilometers
-        const dLat = this.toRadians(lat2 - lat1);
-        const dLon = this.toRadians(lon2 - lon1);
-        
-        const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-                  Math.cos(this.toRadians(lat1)) * Math.cos(this.toRadians(lat2)) *
-                  Math.sin(dLon / 2) * Math.sin(dLon / 2);
-        
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        const distance = R * c; // Distance in kilometers
-        
-        return distance * 1000; // Convert to meters
-    }
-    
-    toRadians(degrees) {
-        return degrees * (Math.PI / 180);
-    }
-    
-    formatDistance(meters) {
-        if (meters < 1000) {
-            return `${Math.round(meters)}m`;
-        } else if (meters < 10000) {
-            return `${(meters / 1000).toFixed(1)}km`;
-        } else {
-            return `${Math.round(meters / 1000)}km`;
-        }
-    }
-    
-    updateDistanceValue(deviceId, value) {
-        const element = document.querySelector(`.current-distance-value[data-device-id="${deviceId}"]`);
+
+    updateDistanceHomeValue(deviceId, value) {
+        const element = document.querySelector(`.distance-home-value[data-device-id="${deviceId}"]`);
         if (element) {
             element.textContent = value;
-            
-            // Add visual feedback for different states
             element.classList.remove('calculating', 'error', 'success');
-            if (value === 'Calculating...') {
+            if (value === 'Loading...') {
                 element.classList.add('calculating');
-            } else if (value.includes('error') || value.includes('unavailable') || value.includes('denied')) {
+            } else if (value === 'Unknown' || value === 'Unavailable') {
                 element.classList.add('error');
-            } else if (value.includes('m') || value.includes('km')) {
+            } else {
                 element.classList.add('success');
             }
         }
     }
-    
-    updateDistanceValues(value) {
-        const elements = document.querySelectorAll('.current-distance-value');
-        elements.forEach(element => {
-            element.textContent = value;
-            element.classList.remove('calculating', 'error', 'success');
+
+    updateBatteryValue(deviceId, batteryStatus) {
+        const element = document.querySelector(`.battery-value[data-device-id="${deviceId}"]`);
+        if (!element) return;
+
+        // Show the battery row
+        const row = element.closest('.battery-row');
+        if (row) row.style.display = '';
+
+        // Set icon and color based on status
+        const label = row ? row.querySelector('.meta-label') : null;
+        const status = batteryStatus.toLowerCase();
+
+        if (status === 'normal' || status === 'full') {
+            element.textContent = 'Normal';
+            element.classList.add('success');
+            if (label) label.innerHTML = '<i class="fa-solid fa-battery-full" style="color: #30A46C"></i> Battery';
+        } else if (status === 'low') {
+            element.textContent = 'Low';
+            element.style.color = '#FF9500';
+            if (label) label.innerHTML = '<i class="fa-solid fa-battery-quarter" style="color: #FF9500"></i> Battery';
+        } else if (status === 'critical') {
+            element.textContent = 'Critical';
             element.classList.add('error');
-        });
+            if (label) label.innerHTML = '<i class="fa-solid fa-battery-empty" style="color: #FF3B30"></i> Battery';
+        } else {
+            element.textContent = batteryStatus;
+        }
     }
     
     initializeSearch() {

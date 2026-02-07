@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.airtrackr.api</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/evelyn/Repos/airtrackr/venv/bin/python3</string>
+        <string>-m</string>
+        <string>uvicorn</string>
+        <string>swift_api:app</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8001</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/evelyn/Repos/airtrackr</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/evelyn/Repos/airtrackr/logs/api.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/evelyn/Repos/airtrackr/logs/api_stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/evelyn/Repos/airtrackr/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>VIRTUAL_ENV</key>
+        <string>/Users/evelyn/Repos/airtrackr/venv</string>
+        <key>AIRTRACKR_API_KEY</key>
+        <string>kq76OQHYekPCXhZIlq0dmHPZx6kIeQv-HjRQk5szPaU</string>
+    </dict>
+</dict>
+</plist>
