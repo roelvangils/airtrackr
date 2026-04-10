@@ -20,16 +20,17 @@ open -a Console "$ERRLOG"
 
 sleep 1
 
-# Arrange windows: Find My left, Ghostty right, Console bottom-right
+# Arrange windows: Find My left 50%, Terminal right-top 25%, Console right-bottom 25%
 osascript << 'APPLESCRIPT'
 tell application "System Events"
     -- Screen dimensions (logical points for 5K retina = 2560x1440)
     set screenW to 2560
     set screenH to 1440
     set halfW to screenW / 2
+    set halfH to (screenH - 25) / 2  -- Account for menu bar
     set menuBar to 25
 
-    -- Find My: left half
+    -- Find My: left half (50% of screen)
     tell application "FindMy" to activate
     delay 0.5
     tell process "FindMy"
@@ -39,23 +40,22 @@ tell application "System Events"
         end try
     end tell
 
-    -- Ghostty: right half, top 60%
+    -- Ghostty: right half, top 50%
     tell application "Ghostty" to activate
     delay 0.3
     tell process "Ghostty"
         try
             set position of window 1 to {halfW, menuBar}
-            set size of window 1 to {halfW, (screenH - menuBar) * 0.6}
+            set size of window 1 to {halfW, halfH}
         end try
     end tell
 
-    -- Console: right half, bottom 40%
+    -- Console: right half, bottom 50%
     delay 0.3
     tell process "Console"
         try
-            set topOffset to menuBar + ((screenH - menuBar) * 0.6)
-            set position of window 1 to {halfW, topOffset}
-            set size of window 1 to {halfW, (screenH - menuBar) * 0.4}
+            set position of window 1 to {halfW, menuBar + halfH}
+            set size of window 1 to {halfW, halfH}
         end try
     end tell
 
@@ -66,9 +66,9 @@ APPLESCRIPT
 
 echo ""
 echo "=== Windows arranged ==="
-echo "  Left:          Find My"
-echo "  Right top:     Ghostty (this terminal)"
-echo "  Right bottom:  Console (error log)"
+echo "  Left 50%:      Find My"
+echo "  Right top:     Ghostty (this terminal) - 25%"
+echo "  Right bottom:  Console (error log) - 25%"
 echo ""
 echo "Starting tracker with caffeinate..."
 echo "Press Ctrl+C to stop."

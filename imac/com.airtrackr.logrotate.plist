@@ -3,24 +3,22 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.airtrackr.night</string>
+    <string>com.airtrackr.logrotate</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/evelyn/Repos/airtrackr/imac/night_sleep.sh</string>
+        <string>/Users/evelyn/Repos/airtrackr/imac/rotate_logs.sh</string>
     </array>
-    <key>RunAtLoad</key>
-    <true/>
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
-        <integer>0</integer>
+        <integer>3</integer>
         <key>Minute</key>
         <integer>0</integer>
     </dict>
     <key>StandardOutPath</key>
-    <string>/Users/evelyn/Repos/airtrackr/logs/night.log</string>
+    <string>/Users/evelyn/Repos/airtrackr/logs/rotate.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/evelyn/Repos/airtrackr/logs/night.log</string>
+    <string>/Users/evelyn/Repos/airtrackr/logs/rotate.log</string>
 </dict>
 </plist>

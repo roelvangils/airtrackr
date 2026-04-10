@@ -26,6 +26,10 @@ from enrichment import haversine_km
 
 # ─── API Key Authentication ───
 
+import logging
+
+logger = logging.getLogger("uvicorn.error")
+
 def _load_api_key() -> Optional[str]:
     """Load API key from AIRTRACKR_API_KEY env var or .api_key file."""
     key = os.environ.get("AIRTRACKR_API_KEY")
@@ -35,6 +39,15 @@ def _load_api_key() -> Optional[str]:
     if key_file.exists():
         return key_file.read_text().strip()
     return None
+
+# Check authentication status at module load and warn if disabled
+_startup_api_key = _load_api_key()
+if _startup_api_key is None:
+    logger.warning(
+        "⚠️  API AUTHENTICATION DISABLED - No .api_key file or AIRTRACKR_API_KEY env var found. "
+        "API is running in development mode without authentication. "
+        "Create a .api_key file with a secret key to enable authentication."
+    )
 
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -137,6 +150,20 @@ class HealthStatus(BaseModel):
     database_size_mb: Optional[float] = None
     oldest_raw_record: Optional[datetime] = None
     summary_count: Optional[int] = None
+    # Tracker health metrics
+    tracker_status: Optional[str] = None  # "active", "stale", "unknown"
+    minutes_since_extraction: Optional[int] = None
+    tracker_warning: Optional[str] = None  # Warning message if tracker is stale
+    # Network health
+    internet_connected: Optional[bool] = None
+    icloud_reachable: Optional[bool] = None
+    # Night mode status
+    night_mode_active: Optional[bool] = None
+    temp_wake_active: Optional[bool] = None
+    temp_wake_expires: Optional[datetime] = None
+    # Permission status
+    permissions_ok: Optional[bool] = None
+    missing_permissions: Optional[str] = None
 
 class Statistics(BaseModel):
     """Statistics for a device over a time period"""
@@ -305,6 +332,119 @@ v1 = APIRouter(prefix="/api/v1")
 
 # ─── General ───
 
+def _check_internet_connectivity() -> tuple[bool, bool]:
+    """
+    Check internet and iCloud connectivity.
+
+    Returns:
+        Tuple of (internet_connected, icloud_reachable)
+    """
+    import socket
+
+    internet_connected = False
+    icloud_reachable = False
+
+    # Check general internet (Google DNS)
+    try:
+        socket.create_connection(("8.8.8.8", 53), timeout=3)
+        internet_connected = True
+    except OSError:
+        pass
+
+    # Check iCloud/Apple connectivity (used by Find My)
+    if internet_connected:
+        try:
+            socket.create_connection(("icloud.com", 443), timeout=3)
+            icloud_reachable = True
+        except OSError:
+            pass
+
+    return internet_connected, icloud_reachable
+
+
+# ─── Night Mode / Wake on Demand ───
+
+NIGHT_FLAG = Path("/tmp/airtrackr_night_mode")
+TEMP_WAKE_FLAG = Path("/tmp/airtrackr_temp_wake")
+TEMP_WAKE_DURATION_MINUTES = 30
+
+
+def _is_night_mode_active() -> bool:
+    """Check if night mode flag exists."""
+    return NIGHT_FLAG.exists()
+
+
+def _get_temp_wake_expiry() -> Optional[datetime]:
+    """Get temp wake expiry time, or None if not active/expired."""
+    if not TEMP_WAKE_FLAG.exists():
+        return None
+    try:
+        expiry_str = TEMP_WAKE_FLAG.read_text().strip()
+        expiry = datetime.fromisoformat(expiry_str)
+        if datetime.now() < expiry:
+            return expiry
+        # Expired - clean up
+        TEMP_WAKE_FLAG.unlink(missing_ok=True)
+        return None
+    except (ValueError, OSError):
+        return None
+
+
+def _trigger_temp_wake() -> bool:
+    """
+    Trigger a temporary wake during night mode.
+
+    - Creates temp wake flag with expiry timestamp
+    - Removes night mode flag so watchdog starts tracker
+    - Returns True if wake was triggered
+    """
+    try:
+        # Calculate expiry time
+        expiry = datetime.now() + timedelta(minutes=TEMP_WAKE_DURATION_MINUTES)
+
+        # Create temp wake flag with expiry
+        TEMP_WAKE_FLAG.write_text(expiry.isoformat())
+
+        # Remove night mode flag (watchdog will start tracker within 5 min)
+        NIGHT_FLAG.unlink(missing_ok=True)
+
+        return True
+    except OSError:
+        return False
+
+
+def _maybe_trigger_wake(minutes_since_extraction: Optional[int]) -> bool:
+    """
+    Check if we should trigger a wake and do it if needed.
+
+    Conditions for triggering:
+    - Night mode is active (00:00 - 07:00)
+    - No temp wake already active
+    - Data is stale (>30 minutes old)
+    - We have internet connectivity
+
+    Returns True if wake was triggered.
+    """
+    # Don't wake if temp wake already active
+    if _get_temp_wake_expiry():
+        return False
+
+    # Only wake during night mode
+    if not _is_night_mode_active():
+        return False
+
+    # Only wake if data is stale
+    if minutes_since_extraction is None or minutes_since_extraction < 30:
+        return False
+
+    # Check internet first - no point waking without connectivity
+    internet_ok, _ = _check_internet_connectivity()
+    if not internet_ok:
+        return False
+
+    return _trigger_temp_wake()
+
+
 @v1.get("/health", response_model=HealthStatus, tags=["General"])
 async def health_check():
     """Check API and database health"""
@@ -318,7 +458,8 @@ async def health_check():
             cursor.execute("SELECT COUNT(*) FROM swift_locations")
             location_count = cursor.fetchone()[0]
 
-            cursor.execute("SELECT MAX(timestamp) FROM swift_locations")
+            # Use extracted_at for tracking health (when we last collected data)
+            cursor.execute("SELECT MAX(extracted_at) FROM swift_locations")
             last_update = cursor.fetchone()[0]
             if last_update:
                 last_update = parse_datetime(last_update)
@@ -335,8 +476,96 @@ async def health_check():
             cursor.execute("SELECT COUNT(*) FROM location_summaries")
             summary_count = cursor.fetchone()[0]
 
+            # Calculate tracker health
+            tracker_status = "unknown"
+            minutes_since_extraction = None
+            tracker_warning = None
+
+            if last_update:
+                now = datetime.now()
+                # Handle timezone-naive comparison
+                if last_update.tzinfo is not None:
+                    from datetime import timezone as tz
+                    now = now.replace(tzinfo=tz.utc)
+                delta = now - last_update
+                minutes_since_extraction = int(delta.total_seconds() / 60)
+
+                if minutes_since_extraction <= 10:
+                    tracker_status = "active"
+                elif minutes_since_extraction <= 30:
+                    tracker_status = "active"  # Still ok, just slower cycle
+                elif minutes_since_extraction <= 60:
+                    tracker_status = "stale"
+                    tracker_warning = f"No updates for {minutes_since_extraction} minutes - tracker may be having issues"
+                else:
+                    tracker_status = "stale"
+                    hours = minutes_since_extraction // 60
+                    tracker_warning = f"No updates for {hours}h {minutes_since_extraction % 60}m - tracker likely stopped or Find My not responding"
+
+            # Check internet connectivity
+            internet_connected, icloud_reachable = _check_internet_connectivity()
+
+            # Check night mode status
+            night_mode_active = _is_night_mode_active()
+            temp_wake_expiry = _get_temp_wake_expiry()
+            temp_wake_active = temp_wake_expiry is not None
+
+            # Wake on demand: if data is stale during night mode, trigger temporary wake
+            wake_triggered = False
+            if night_mode_active and not temp_wake_active:
+                wake_triggered = _maybe_trigger_wake(minutes_since_extraction)
+                if wake_triggered:
+                    # Update status - wake was just triggered
+                    night_mode_active = False  # Flag was just removed
+                    temp_wake_expiry = _get_temp_wake_expiry()
+                    temp_wake_active = True
+
+            # Determine overall status and warnings
+            warnings = []
+            if tracker_warning and not night_mode_active and not temp_wake_active:
+                # Only show tracker warning if not in night mode
+                warnings.append(tracker_warning)
+            if wake_triggered:
+                warnings.append(f"Wake on demand triggered - tracker will resume within 5 minutes")
+            if night_mode_active:
+                warnings.append("Night mode active (00:00-07:00) - tracker paused")
+            if temp_wake_active:
+                mins_left = int((temp_wake_expiry - datetime.now()).total_seconds() / 60)
+                warnings.append(f"Temporary wake active - {mins_left} minutes remaining")
+            if not internet_connected:
+                warnings.append("No internet connection - Find My cannot sync")
+            elif not icloud_reachable:
+                warnings.append("Cannot reach iCloud - Find My sync may fail")
+
+            # Determine overall status
+            if not internet_connected:
+                overall_status = "unhealthy"
+            elif night_mode_active:
+                overall_status = "night_mode"  # Special status for night mode
+            elif tracker_status == "stale" or not icloud_reachable:
+                overall_status = "degraded"
+            else:
+                overall_status = "healthy"
+
+            # Check for missing permissions (flag file from permission-check script)
+            permissions_ok = True
+            missing_permissions = None
+            perm_flag = Path("/tmp/airtrackr_missing_permissions")
+            if perm_flag.exists():
+                try:
+                    missing_permissions = perm_flag.read_text().strip()
+                    permissions_ok = False
+                    warnings.append(f"Missing permissions: {missing_permissions}")
+                    if overall_status == "healthy":
+                        overall_status = "degraded"
+                except OSError:
+                    pass
+
+            # Combine warnings
+            combined_warning = " | ".join(warnings) if warnings else None
+
             return HealthStatus(
-                status="healthy",
+                status=overall_status,
                 database_connected=True,
                 total_devices=device_count,
                 total_locations=location_count,
@@ -345,6 +574,16 @@ async def health_check():
                 database_size_mb=db_size_mb,
                 oldest_raw_record=oldest_raw_record,
                 summary_count=summary_count,
+                tracker_status=tracker_status,
+                minutes_since_extraction=minutes_since_extraction,
+                tracker_warning=combined_warning,
+                internet_connected=internet_connected,
+                icloud_reachable=icloud_reachable,
+                night_mode_active=night_mode_active,
+                temp_wake_active=temp_wake_active,
+                temp_wake_expires=temp_wake_expiry,
+                permissions_ok=permissions_ok,
+                missing_permissions=missing_permissions,
             )
     except Exception:
         return HealthStatus(
