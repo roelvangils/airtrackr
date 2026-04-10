@@ -21,7 +21,7 @@ import os
 import sys
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -30,21 +30,67 @@ from geocoding import Geocoder
 from db import get_connection, init_schema, is_duplicate, sanitize_device_data, resolve_location_alias, resolve_device_alias
 from enrichment import compute_distance_from_home, update_visits, detect_trips
 
-# Configure logging with DEBUG level for verbose output
-# Create logs directory if it doesn't exist
+# Night mode / temp wake flags
+NIGHT_FLAG = Path("/tmp/airtrackr_night_mode")
+TEMP_WAKE_FLAG = Path("/tmp/airtrackr_temp_wake")
+
+# Configure logging - file only to avoid duplicates
+# Console shows key events via print(), detailed logs go to file
 Path("logs").mkdir(exist_ok=True)
 
-# Configure logging to both file and console
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        logging.FileHandler('logs/tracker.log'),
-        logging.StreamHandler()
+        logging.FileHandler('logs/tracker.log')
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Singleton: PID file to ensure only one tracker instance runs
+PID_FILE = Path("/tmp/airtrackr_tracker.pid")
+
+
+def ensure_singleton():
+    """
+    Ensure only one tracker instance runs at a time.
+    Kills any existing instance before starting.
+    """
+    import signal
+
+    current_pid = os.getpid()
+
+    # Check if another instance is running
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            if old_pid != current_pid:
+                # Check if process is still running
+                try:
+                    os.kill(old_pid, 0)  # Signal 0 = check if process exists
+                    # Process exists, kill it
+                    logger.info(f"[SINGLETON] Killing existing tracker instance (PID {old_pid})")
+                    os.kill(old_pid, signal.SIGTERM)
+                    time.sleep(2)
+                    # Force kill if still running
+                    try:
+                        os.kill(old_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                except ProcessLookupError:
+                    # Process doesn't exist, stale PID file
+                    logger.info(f"[SINGLETON] Removing stale PID file (PID {old_pid} not running)")
+        except (ValueError, FileNotFoundError):
+            pass
+
+    # Write our PID
+    PID_FILE.write_text(str(current_pid))
+    logger.info(f"[SINGLETON] Tracker started with PID {current_pid}")
+
+    # Clean up PID file on exit
+    import atexit
+    atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
 
 
 class OrchestratedAirTagTracker:
@@ -63,11 +109,30 @@ class OrchestratedAirTagTracker:
     EXTRACT_PAUSE = 15     # Pause after extracting data
     CYCLE_END_PAUSE = 60   # Pause at end of cycle before repeating
 
+    # Failure recovery settings
+    MAX_CONSECUTIVE_FAILURES = 5
+    FINDMY_RESTART_COOLDOWN = 300  # 5 minutes between restarts
+
+    # Keep-alive settings
+    KEEPALIVE_INTERVAL = 1800  # 30 minutes - force refresh Find My
+    PREEMPTIVE_RESTART_INTERVAL = 14400  # 4 hours - restart Find My to prevent stale state
+
+    # Path to fix script
+    FIX_FINDMY_SCRIPT = Path(__file__).parent / "imac" / "fix_findmy_window.sh"
+
     def __init__(self):
         """Initialize the orchestrated tracker."""
         self.swift_extractor = Path(__file__).parent / "swift" / "airtag_extractor"
         self.automation = FindMyAutomation()
         self.geocoder = Geocoder()
+
+        # Failure tracking for auto-recovery
+        self.consecutive_failures = 0
+        self.last_findmy_restart: Optional[datetime] = None
+
+        # Keep-alive tracking
+        self.last_keepalive: Optional[datetime] = None
+        self.last_preemptive_restart: Optional[datetime] = None
 
         # Verify Swift extractor exists
         if not self.swift_extractor.exists() or not os.access(self.swift_extractor, os.X_OK):
@@ -160,10 +225,17 @@ class OrchestratedAirTagTracker:
                         logger.debug(f"Skipping {device_data['name']}: no usable location")
                         continue
 
-                    # Parse extracted_at timestamp
+                    # Parse extracted_at timestamp (Swift outputs UTC with Z suffix)
                     extracted_at = cleaned.get('extractedAt', '')
                     if extracted_at:
-                        extracted_at = extracted_at.replace('T', ' ').replace('Z', '')
+                        # Parse UTC timestamp and convert to local timezone
+                        try:
+                            utc_dt = datetime.fromisoformat(extracted_at.replace('Z', '+00:00'))
+                            local_dt = utc_dt.astimezone()  # Convert to system timezone
+                            extracted_at = local_dt.strftime('%Y-%m-%d %H:%M:%S')
+                        except ValueError:
+                            # Fallback for unexpected formats
+                            extracted_at = extracted_at.replace('T', ' ').replace('Z', '')
 
                     device_name = resolve_device_alias(cleaned['name'])
                     location_text = cleaned['location']
@@ -171,6 +243,11 @@ class OrchestratedAirTagTracker:
                     # Skip duplicates within 2-minute window
                     if is_duplicate(conn, device_name, location_text):
                         logger.debug(f"Skipping duplicate: {device_name} at {location_text}")
+                        # Update last_seen in swift_devices, even without a new location record
+                        cursor.execute('''
+                            UPDATE swift_devices SET last_seen = CURRENT_TIMESTAMP
+                            WHERE device_name = ?
+                        ''', (device_name,))
                         continue
 
                     # Resolve alias (e.g. "Home" → "Onderstraat 7, 9000 Ghent")
@@ -255,6 +332,8 @@ class OrchestratedAirTagTracker:
 
                 conn.commit()
                 logger.info(f"Saved {saved_count}/{len(devices)} {device_type} updates")
+                if saved_count > 0:
+                    print(f"           💾 {device_type}: {saved_count} saved")
 
             except Exception as e:
                 logger.error(f"Error saving {device_type} tab: {e}")
@@ -262,6 +341,169 @@ class OrchestratedAirTagTracker:
                 return 0, set()
 
         return saved_count, saved_device_names
+
+    def _handle_extraction_failure(self, device_type: str) -> None:
+        """
+        Track consecutive failures and restart Find My if threshold exceeded.
+
+        Args:
+            device_type: Type of tab that failed extraction
+        """
+        self.consecutive_failures += 1
+        logger.warning(
+            f"[FAILURE] Extraction failure {self.consecutive_failures}/{self.MAX_CONSECUTIVE_FAILURES} "
+            f"for {device_type} tab"
+        )
+
+        if self.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+            # Check cooldown to avoid restart loops
+            if self.last_findmy_restart:
+                seconds_since_restart = (datetime.now() - self.last_findmy_restart).total_seconds()
+                if seconds_since_restart < self.FINDMY_RESTART_COOLDOWN:
+                    logger.warning(
+                        f"[RECOVERY] Skipping Find My restart (cooldown: {int(self.FINDMY_RESTART_COOLDOWN - seconds_since_restart)}s remaining)"
+                    )
+                    return
+
+            logger.error(
+                f"[RECOVERY] {self.MAX_CONSECUTIVE_FAILURES} consecutive failures, restarting Find My..."
+            )
+            self._restart_find_my()
+            self.consecutive_failures = 0
+
+    def _try_fix_findmy_window(self) -> bool:
+        """
+        Call fix_findmy_window.sh to recover from dialog/window issues.
+
+        This script handles:
+        - Find My running with 0 windows (blocked by dialog)
+        - AppleScript returning empty results
+        - Onboarding/What's New dialogs
+
+        Returns:
+            True if fix script ran successfully, False otherwise
+        """
+        if not self.FIX_FINDMY_SCRIPT.exists():
+            logger.warning(f"[FIX] Script not found: {self.FIX_FINDMY_SCRIPT}")
+            return False
+
+        try:
+            logger.info("[FIX] Running fix_findmy_window.sh to recover window state...")
+            result = subprocess.run(
+                ['bash', str(self.FIX_FINDMY_SCRIPT)],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                logger.info("[FIX] Fix script completed successfully")
+                time.sleep(2)  # Give Find My time to stabilize
+                return True
+            else:
+                logger.warning(f"[FIX] Fix script returned {result.returncode}")
+                if result.stderr:
+                    logger.warning(f"[FIX] stderr: {result.stderr}")
+                return False
+        except subprocess.TimeoutExpired:
+            logger.error("[FIX] Fix script timed out")
+            return False
+        except Exception as e:
+            logger.error(f"[FIX] Failed to run fix script: {e}")
+            return False
+
+    def _restart_find_my(self) -> None:
+        """Force quit and relaunch Find My app."""
+        logger.info("[RECOVERY] Killing Find My app...")
+        print("           ⚠️  Restarting Find My (too many failures)")
+
+        try:
+            subprocess.run(['pkill', '-9', 'FindMy'], capture_output=True)
+            time.sleep(2)
+
+            logger.info("[RECOVERY] Relaunching Find My...")
+            self.automation.ensure_find_my_running()
+
+            # Extra time for iCloud sync after restart
+            logger.info("[RECOVERY] Waiting 15s for iCloud sync...")
+            time.sleep(15)
+
+            self.last_findmy_restart = datetime.now()
+            logger.info("[RECOVERY] Find My restarted successfully")
+        except Exception as e:
+            logger.error(f"[RECOVERY] Failed to restart Find My: {e}")
+
+    def _reset_failure_count(self) -> None:
+        """Reset consecutive failure count after successful extraction."""
+        if self.consecutive_failures > 0:
+            logger.debug(f"Reset failure count (was {self.consecutive_failures})")
+            self.consecutive_failures = 0
+
+    def _maybe_keepalive(self) -> None:
+        """
+        Periodically refresh Find My to prevent stale state.
+
+        Runs every KEEPALIVE_INTERVAL seconds.
+        """
+        now = datetime.now()
+
+        # Check if it's time for a preemptive restart (more aggressive)
+        if self.last_preemptive_restart is None or \
+           (now - self.last_preemptive_restart).total_seconds() >= self.PREEMPTIVE_RESTART_INTERVAL:
+            logger.info("[KEEPALIVE] Preemptive Find My restart (every 4h to prevent stale state)")
+            print("           🔄 Preemptive Find My restart")
+            self._restart_find_my()
+            self.last_preemptive_restart = now
+            self.last_keepalive = now  # Also counts as keepalive
+            return
+
+        # Check if it's time for a simple refresh
+        if self.last_keepalive is None or \
+           (now - self.last_keepalive).total_seconds() >= self.KEEPALIVE_INTERVAL:
+            logger.info("[KEEPALIVE] Sending refresh to Find My")
+            self.automation.refresh_find_my()
+            self.automation.simulate_mouse_jiggle()
+            self.last_keepalive = now
+
+    def _check_temp_wake_expiry(self) -> bool:
+        """
+        Check if temp wake has expired and restore night mode if needed.
+
+        During a temp wake (triggered by API during night mode), the tracker
+        runs for 30 minutes. When this expires, we restore the night mode flag
+        and the tracker should exit (watchdog won't restart it).
+
+        Returns:
+            True if night mode was restored (tracker should exit)
+        """
+        if not TEMP_WAKE_FLAG.exists():
+            return False
+
+        try:
+            expiry_str = TEMP_WAKE_FLAG.read_text().strip()
+            expiry = datetime.fromisoformat(expiry_str)
+
+            if datetime.now() >= expiry:
+                # Temp wake expired - restore night mode
+                logger.info("[TEMP_WAKE] Wake period expired, restoring night mode...")
+                print("           🌙 Temp wake expired, going back to sleep")
+
+                # Restore night mode flag
+                NIGHT_FLAG.write_text(datetime.now().isoformat())
+
+                # Remove temp wake flag
+                TEMP_WAKE_FLAG.unlink(missing_ok=True)
+
+                return True
+
+            else:
+                # Temp wake still active
+                mins_left = int((expiry - datetime.now()).total_seconds() / 60)
+                logger.debug(f"[TEMP_WAKE] Still active, {mins_left} minutes remaining")
+                return False
+
+        except (ValueError, OSError) as e:
+            logger.warning(f"[TEMP_WAKE] Error checking expiry: {e}")
+            return False
 
     def process_tab(self, device_type: DeviceType) -> bool:
         """
@@ -283,13 +525,32 @@ class OrchestratedAirTagTracker:
         # Ensure Find My is active and switch to tab
         if not self.automation.ensure_find_my_running():
             logger.error(f"Failed to ensure Find My is running for {tab_name} tab")
-            return False
+            # Try immediate fix before giving up
+            logger.info(f"[FIX] Attempting immediate recovery for {tab_name} tab...")
+            if self._try_fix_findmy_window():
+                # Retry after fix
+                if not self.automation.ensure_find_my_running():
+                    logger.error(f"[FIX] Recovery failed for {tab_name} tab")
+                    return False
+                logger.info(f"[FIX] Recovery successful, continuing with {tab_name} tab")
+            else:
+                return False
 
         self.automation.activate_find_my()
 
         if not self.automation.switch_to_tab(device_type):
             logger.error(f"Failed to switch to {tab_name} tab")
-            return False
+            # Try immediate fix before giving up
+            logger.info(f"[FIX] Attempting immediate recovery for tab switch...")
+            if self._try_fix_findmy_window():
+                # Retry tab switch after fix
+                self.automation.activate_find_my()
+                if not self.automation.switch_to_tab(device_type):
+                    logger.error(f"[FIX] Tab switch still failing after recovery")
+                    return False
+                logger.info(f"[FIX] Tab switch recovered successfully")
+            else:
+                return False
 
         # Wait for tab to load (Devices tab needs more time than People/Items)
         load_time = self.TAB_LOAD_TIME[device_type]
@@ -301,7 +562,11 @@ class OrchestratedAirTagTracker:
 
         if not devices:
             logger.warning(f"No {device_type}s found in {tab_name} tab")
+            self._handle_extraction_failure(device_type)
             return False
+
+        # Successful extraction - reset failure counter
+        self._reset_failure_count()
 
         # Log summary
         logger.info(f"Found {len(devices)} {device_type}(s):")
@@ -331,9 +596,14 @@ class OrchestratedAirTagTracker:
         Returns:
             True if at least one tab was successfully processed
         """
-        logger.info("\n" + "=" * 70)
-        logger.info("🔄 STARTING NEW TRACKING CYCLE")
+        cycle_start = datetime.now().strftime('%H:%M:%S')
         logger.info("=" * 70)
+        logger.info("STARTING NEW TRACKING CYCLE")
+        logger.info("=" * 70)
+        print(f"\n[{cycle_start}] 🔄 Starting cycle...")
+
+        # Check if keep-alive actions are needed
+        self._maybe_keepalive()
 
         # Initial pause
         logger.info(f"Initial pause: {self.INITIAL_PAUSE}s...")
@@ -357,8 +627,10 @@ class OrchestratedAirTagTracker:
                 time.sleep(self.EXTRACT_PAUSE)
 
         # End of cycle pause
-        logger.info(f"\n✅ Cycle complete! {success_count}/{len(tabs)} tabs processed successfully")
-        logger.info(f"Pausing {self.CYCLE_END_PAUSE}s before next cycle...\n")
+        cycle_end = datetime.now().strftime('%H:%M:%S')
+        logger.info(f"Cycle complete! {success_count}/{len(tabs)} tabs processed successfully")
+        logger.info(f"Pausing {self.CYCLE_END_PAUSE}s before next cycle...")
+        print(f"[{cycle_end}] ✅ Cycle complete: {success_count}/3 tabs")
 
         return success_count > 0
 
@@ -391,6 +663,11 @@ class OrchestratedAirTagTracker:
 
         try:
             while True:
+                # Check if temp wake expired (should go back to night mode)
+                if self._check_temp_wake_expiry():
+                    logger.info("Temp wake expired, exiting tracker...")
+                    break
+
                 self.run_single_cycle()
                 self._maybe_run_retention()
                 time.sleep(self.CYCLE_END_PAUSE)
@@ -425,6 +702,11 @@ class OrchestratedAirTagTracker:
         # Then run on schedule
         try:
             while True:
+                # Check if temp wake expired (should go back to night mode)
+                if self._check_temp_wake_expiry():
+                    logger.info("Temp wake expired, exiting tracker...")
+                    break
+
                 schedule.run_pending()
                 time.sleep(1)
         except KeyboardInterrupt:
@@ -434,6 +716,9 @@ class OrchestratedAirTagTracker:
 def main():
     """Main entry point for command-line usage."""
     import argparse
+
+    # Ensure only one instance runs at a time
+    ensure_singleton()
 
     parser = argparse.ArgumentParser(
         description="Orchestrated AirTag tracker with automatic tab cycling"

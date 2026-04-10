@@ -1,7 +1,7 @@
 #!/bin/bash
-# AirTrackr — Put display to sleep during night hours (01:00–07:00)
+# AirTrackr — Put display to sleep during night hours (00:00–07:00)
 #
-# Runs at 01:00 every night AND at login (RunAtLoad).
+# Runs at midnight every night AND at login (RunAtLoad).
 # At login, only sleeps the display if current time is in the night window.
 # This handles reboots that happen during the night (e.g. Monday 04:00).
 
@@ -9,7 +9,8 @@ LOG="/Users/evelyn/Repos/airtrackr/logs/tracker.log"
 NIGHT_FLAG="/tmp/airtrackr_night_mode"
 HOUR=$(date +%H)
 
-if [ "$HOUR" -ge 1 ] && [ "$HOUR" -lt 7 ]; then
+# Night window is 00:00 - 07:00 (hour 0, 1, 2, 3, 4, 5, 6)
+if [ "$HOUR" -lt 7 ]; then
     sleep 30  # wait for boot/login to settle
     echo "$(date '+%Y-%m-%d %H:%M:%S') - scheduler - INFO - [NIGHT] Creating night mode flag" >> "$LOG"
     touch "$NIGHT_FLAG"

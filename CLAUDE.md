@@ -127,3 +127,44 @@ Base URL: `http://localhost:8001`
 - Geocoding uses a 1.1s rate limit for Nominatim (free tier)
 - The orchestrated tracker cycles through all 3 tabs in ~3 minutes
 - Dashboard uses Google Maps iframe for location display
+
+## CRITICAL: iMac Remote Access Safety
+
+The tracking runs on a remote iMac (evelyn@192.168.50.6) that is physically located in another office. **Auto-login is NOT configured**, so if the machine shuts down or logs out, it requires physical access to recover.
+
+### NEVER run these commands on the iMac:
+- `sudo shutdown` — macOS has NO dry-run flag, it executes immediately
+- `sudo reboot` or `sudo /sbin/shutdown -r` — same issue
+- `osascript -e 'tell application "System Events" to log out'` — will log out and require physical login
+- `launchctl reboot` — will restart the login session
+
+### Safe alternatives for testing:
+- Use `echo "would run: <command>"` instead of actually running dangerous commands
+- Always ask the user before running any shutdown/reboot/logout commands
+- Use the `/restart-imac` skill which has proper safeguards
+
+### Recovery watchdog (scripts/recovery_watchdog.sh)
+The watchdog monitors tracking health and can trigger logout/reboot for recovery.
+**This requires auto-login to be configured first** — see setup instructions below.
+
+### TODO: Enable auto-login
+Before the watchdog can safely use logout/reboot recovery, run on the iMac:
+```bash
+sudo sysadminctl -autologin set -userName evelyn -password <PASSWORD>
+```
+
+### Wake-on-LAN (for sleep recovery only)
+
+The iMac has Wake-on-LAN enabled (`pmset -a womp 1`). This only works when the Mac is **sleeping**, not after a full shutdown.
+
+**MAC addresses** (try all three):
+- `BE:1F:49:CD:A7:0C`
+- `2E:AC:B9:A9:1A:5F`
+- `DA:77:6A:89:EE:20`
+
+**To wake the iMac from sleep** (run from jump server):
+```bash
+ssh roel@kumulus.11ways.be 'wakeonlan BE:1F:49:CD:A7:0C; wakeonlan 2E:AC:B9:A9:1A:5F; wakeonlan DA:77:6A:89:EE:20'
+```
+
+**Note:** WoL does NOT work after `shutdown -h` (full power off). The Mac must be in sleep mode for WoL to work.
