@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AirTrackr tracker: cycles the Find My tabs and records locations.
+
+  Do not load this file directly — it contains @@REPO@@ placeholders.
+  Run ./launchd/install.sh, which fills them in and installs into
+  ~/Library/LaunchAgents.
+
+  IMPORTANT — Accessibility permission:
+  The tracker reads Find My through the Accessibility APIs, and macOS grants that
+  permission per-executable. A LaunchAgent runs outside Terminal, so Terminal's
+  grant does not cover it. After installing, run one cycle and macOS will prompt;
+  grant it to the process it names (usually the venv's python3). Until then the
+  extractor exits 2 (ax_not_trusted) and says so in logs/tracker.log.
+
+  LimitLoadToSessionType Aqua keeps this out of headless/ssh contexts, where Find
+  My has no window to read.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.airtrackr.tracker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@@REPO@@/venv/bin/python</string>
+        <string>@@REPO@@/orchestrated_tracker.py</string>
+        <string>--schedule</string>
+        <string>5</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@@REPO@@</string>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>@@REPO@@/logs/tracker.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>@@REPO@@/logs/tracker.out.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AIRTRACKR_DB</key>
+        <string>@@REPO@@/database/airtracker.db</string>
+    </dict>
+</dict>
+</plist>

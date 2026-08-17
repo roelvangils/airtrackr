@@ -29,22 +29,13 @@ source venv/bin/activate
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
-# Check if FindMy is running
+# Make sure Find My is running. The tracker's extractor can start it itself, but
+# launching it here means the first cycle doesn't have to. Never prompt: these
+# scripts also run from launchd, where a `read` would hang forever under `set -e`.
 if ! pgrep -x "FindMy" > /dev/null; then
-    echo -e "${YELLOW}⚠️  Warning: FindMy app is not running${NC}"
-    echo "   The tracker requires FindMy to be open."
-    echo ""
-    read -p "   Would you like to launch FindMy now? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "   Opening FindMy..."
-        open -a "FindMy"
-        echo "   Waiting for FindMy to launch..."
-        sleep 5
-    else
-        echo -e "${RED}❌ Cancelled. Please launch FindMy manually.${NC}"
-        exit 1
-    fi
+    echo -e "${YELLOW}FindMy is not running - launching it...${NC}"
+    open -b com.apple.findmy || true
+    sleep 5
 fi
 
 # Default schedule: 5 minutes

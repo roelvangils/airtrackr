@@ -75,11 +75,13 @@ app = FastAPI(
 # CORS middleware — restrict to known dashboard origins
 app.add_middleware(
     CORSMiddleware,
+    # The dashboard derives its API URL from window.location.hostname, so any host
+    # it is served from must be listed here. Add extra origins via
+    # AIRTRACKR_CORS_ORIGINS (comma-separated) rather than editing this list.
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        "http://192.168.50.6:3000",
-    ],
+    ] + [o.strip() for o in os.environ.get("AIRTRACKR_CORS_ORIGINS", "").split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "X-API-Key"],
@@ -123,6 +125,7 @@ class DeviceTypeCounts(BaseModel):
     people: int
     devices: int
     items: int
+    me: int = 0
     total: int
 
 class PaginatedResponse(BaseModel):
@@ -600,7 +603,7 @@ async def health_check():
 
 @v1.get("/devices", response_model=PaginatedResponse, tags=["Devices"])
 async def get_devices(
-    device_type: Optional[str] = Query(None, description="Filter by device type: person, device, or item"),
+    device_type: Optional[str] = Query(None, description="Filter by device type: person, device, item, or me"),
     limit: int = Query(50, ge=1, le=500, description="Maximum number of devices"),
     offset: int = Query(0, ge=0, description="Number of records to skip"),
 ):
@@ -660,21 +663,18 @@ async def get_device_counts():
             WHERE device_type IS NOT NULL
             GROUP BY device_type
         """)
-        counts = {'people': 0, 'devices': 0, 'items': 0}
+        key_for_type = {'person': 'people', 'device': 'devices', 'item': 'items', 'me': 'me'}
+        counts = {'people': 0, 'devices': 0, 'items': 0, 'me': 0}
         for row in cursor.fetchall():
-            dt = row['device_type']
-            c = row['count']
-            if dt == 'person':
-                counts['people'] = c
-            elif dt == 'device':
-                counts['devices'] = c
-            elif dt == 'item':
-                counts['items'] = c
+            key = key_for_type.get(row['device_type'])
+            if key:
+                counts[key] = row['count']
         return DeviceTypeCounts(
             people=counts['people'],
             devices=counts['devices'],
             items=counts['items'],
-            total=counts['people'] + counts['devices'] + counts['items'],
+            me=counts['me'],
+            total=sum(counts.values()),
         )
 
 
@@ -1229,10 +1229,12 @@ async def delete_zone(zone_id: int):
 # ─── Tracking ───
 
 def _run_tracking():
-    """Background tracking task."""
-    from swift_tracker import SwiftAirTagTracker
-    tracker = SwiftAirTagTracker()
-    tracker.track_once()
+    """Background tracking task: one full pass over every Find My tab."""
+    # Was swift_tracker.SwiftAirTagTracker, a single-tab tracker that only ever
+    # read whichever tab happened to be open. That module is gone; the orchestrated
+    # tracker cycles all four tabs and verifies which one it actually read.
+    from orchestrated_tracker import OrchestratedAirTagTracker
+    OrchestratedAirTagTracker().run_single_cycle()
 
 
 @v1.post("/track", tags=["Actions"])

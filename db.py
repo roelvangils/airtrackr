@@ -6,6 +6,7 @@ Provides a single get_connection() context manager used by all consumers,
 with WAL mode, foreign keys, and schema migrations via PRAGMA user_version.
 """
 
+import os
 import re
 import sqlite3
 import logging
@@ -18,10 +19,13 @@ from dateutil.relativedelta import relativedelta
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path("database/airtracker.db")
+# Anchored to this file, not the process CWD — the API and the tracker are launched
+# from different working directories (and from launchd, which has none to speak of),
+# and a relative path silently created a second, empty database.
+DB_PATH = Path(os.environ.get("AIRTRACKR_DB", Path(__file__).resolve().parent / "database" / "airtracker.db"))
 
 # Current schema version — bump this when adding migrations
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 @contextmanager
@@ -74,6 +78,9 @@ def init_schema():
         if current_version < 4:
             _migrate_to_v4(conn)
 
+        if current_version < 5:
+            _migrate_to_v5(conn)
+
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
@@ -99,7 +106,7 @@ def _migrate_to_v1(conn: sqlite3.Connection):
             distance TEXT,
             latitude REAL,
             longitude REAL,
-            device_type TEXT CHECK(device_type IN ('person', 'device', 'item')),
+            device_type TEXT CHECK(device_type IN ('person', 'device', 'item', 'me')),
             raw_data TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             extracted_at TIMESTAMP
@@ -110,7 +117,7 @@ def _migrate_to_v1(conn: sqlite3.Connection):
         CREATE TABLE IF NOT EXISTS swift_devices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             device_name TEXT UNIQUE NOT NULL,
-            device_type TEXT CHECK(device_type IN ('person', 'device', 'item')),
+            device_type TEXT CHECK(device_type IN ('person', 'device', 'item', 'me')),
             first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_location TEXT,
@@ -336,6 +343,76 @@ def _migrate_to_v4(conn: sqlite3.Connection):
     logger.info("Migrated database to schema v4")
 
 
+_OLD_DEVICE_TYPE_CHECK = "device_type TEXT CHECK(device_type IN ('person', 'device', 'item'))"
+_NEW_DEVICE_TYPE_CHECK = "device_type TEXT CHECK(device_type IN ('person', 'device', 'item', 'me'))"
+
+
+def _relax_device_type_check(conn: sqlite3.Connection, table: str):
+    """
+    Add 'me' to a table's device_type CHECK constraint.
+
+    SQLite cannot alter a CHECK in place, so the table is rebuilt: capture the
+    original CREATE statement, rewrite just the CHECK clause, copy the rows over,
+    and restore the indexes (dropping a table drops its indexes with it).
+    """
+    cursor = conn.cursor()
+    row = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    if not row or not row[0]:
+        return  # table doesn't exist yet; _migrate_to_v1 will create it with the new CHECK
+
+    create_sql = row[0]
+    if "'me'" in create_sql:
+        return  # already relaxed
+    if _OLD_DEVICE_TYPE_CHECK not in create_sql:
+        logger.warning("Unexpected device_type CHECK on %s; leaving it alone", table)
+        return
+
+    index_sql = [
+        r[0] for r in cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+            (table,),
+        ).fetchall()
+    ]
+    columns = [r[1] for r in cursor.execute(f"PRAGMA table_info({table})").fetchall()]
+    column_list = ", ".join(f'"{c}"' for c in columns)
+
+    cursor.execute(f"ALTER TABLE {table} RENAME TO {table}_pre_v5")
+    cursor.execute(create_sql.replace(_OLD_DEVICE_TYPE_CHECK, _NEW_DEVICE_TYPE_CHECK))
+    cursor.execute(f"INSERT INTO {table} ({column_list}) SELECT {column_list} FROM {table}_pre_v5")
+    cursor.execute(f"DROP TABLE {table}_pre_v5")
+    for sql in index_sql:
+        cursor.execute(sql)
+
+    logger.info("Relaxed device_type CHECK on %s to include 'me'", table)
+
+
+def _migrate_to_v5(conn: sqlite3.Connection):
+    """
+    Migration to v5 (macOS 27 / Find My 5.0 extractor):
+    - Allow device_type 'me' for the new fourth Find My tab
+    - Structured fields the rewritten Swift extractor now reports directly:
+      distance_km, proximity, has_location
+    """
+    cursor = conn.cursor()
+
+    for col, col_type in [
+        ('distance_km', 'REAL'),
+        ('proximity', 'TEXT'),
+        ('has_location', 'INTEGER'),
+    ]:
+        try:
+            cursor.execute(f'ALTER TABLE swift_locations ADD COLUMN {col} {col_type}')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    for table in ('swift_locations', 'swift_devices'):
+        _relax_device_type_check(conn, table)
+
+    conn.commit()
+    logger.info("Migrated database to schema v5")
+
 
 def _import_geocoding_cache(conn: sqlite3.Connection):
     """Import data from the separate geocoding_cache.db if it exists."""
@@ -387,49 +464,37 @@ def resolve_location_alias(location: str) -> str:
     return location
 
 
-# Regex patterns for time status strings that may leak into location text.
-# Matches: "6 min ago", "2 hours ago", "8 mo ago", "3 days ago", "Last mo",
-# "Last week", "Yesterday", "Now", "Paused"
-_TIME_PATTERNS = [
-    r'\d+\s+min\s+ago',
-    r'\d+\s+(?:hr|hours?)\s+ago',
-    r'\d+\s+days?\s+ago',
-    r'\d+\s+mo\s+ago',
-    r'\d+\s+weeks?\s+ago',
-    r'Last\s+\w+',
-    r'Yesterday',
-    r'Now',
-    r'Paused',
-]
-_TIME_SUFFIX_RE = re.compile(
-    r',\s*(' + '|'.join(_TIME_PATTERNS) + r')\s*$',
-    re.IGNORECASE,
-)
-_TIME_VALUE_RE = re.compile(
-    r'^(' + '|'.join(_TIME_PATTERNS) + r')$',
-    re.IGNORECASE,
-)
-_DISTANCE_NUM_RE = re.compile(r'^\d+\s+(km|m)$')
+# Find My on macOS 26+ abbreviates units with a trailing period — "14 min. ago",
+# "2 hr. ago" — where it used to write "14 min ago". Every pattern below therefore
+# allows an optional '.' after the unit; without it each relative timestamp silently
+# resolved to None.
+_UNIT_DOT = r'\.?'
 
 # Stale time statuses — hours, days, weeks, months old = no real location update
 _STALE_TIME_RE = re.compile(
-    r'^(\d+)\s+(hr|hours?|days?|weeks?|mo)\s+ago$|^Yesterday$|^Last\s+(week|mo)$',
+    r'^(\d+)\s+(hr|hrs|hours?|days?|weeks?|mo|months?)' + _UNIT_DOT + r'\s+ago$'
+    r'|^Yesterday$|^Last\s+(week|mo)$',
     re.IGNORECASE,
 )
 
 # Patterns for converting relative time to absolute timestamps.
 # Uses relativedelta for months so "10 mo ago" on Feb 5 gives Apr 5, not a 300-day guess.
 _RELATIVE_TIME_RULES_TD = [
-    (re.compile(r'^(\d+)\s+min\s+ago$', re.I), lambda m: timedelta(minutes=int(m.group(1)))),
-    (re.compile(r'^(\d+)\s+(?:hr|hours?)\s+ago$', re.I), lambda m: timedelta(hours=int(m.group(1)))),
-    (re.compile(r'^(\d+)\s+days?\s+ago$', re.I), lambda m: timedelta(days=int(m.group(1)))),
-    (re.compile(r'^(\d+)\s+weeks?\s+ago$', re.I), lambda m: timedelta(weeks=int(m.group(1)))),
+    (re.compile(r'^(\d+)\s+(?:min|mins|minutes?)' + _UNIT_DOT + r'\s+ago$', re.I),
+     lambda m: timedelta(minutes=int(m.group(1)))),
+    (re.compile(r'^(\d+)\s+(?:hr|hrs|hours?)' + _UNIT_DOT + r'\s+ago$', re.I),
+     lambda m: timedelta(hours=int(m.group(1)))),
+    (re.compile(r'^(\d+)\s+days?' + _UNIT_DOT + r'\s+ago$', re.I),
+     lambda m: timedelta(days=int(m.group(1)))),
+    (re.compile(r'^(\d+)\s+weeks?' + _UNIT_DOT + r'\s+ago$', re.I),
+     lambda m: timedelta(weeks=int(m.group(1)))),
     (re.compile(r'^Yesterday$', re.I), lambda m: timedelta(days=1)),
     (re.compile(r'^Last\s+week$', re.I), lambda m: timedelta(weeks=1)),
-    (re.compile(r'^Now$', re.I), lambda m: timedelta(seconds=0)),
+    (re.compile(r'^(?:Now|Just now)$', re.I), lambda m: timedelta(seconds=0)),
 ]
 _RELATIVE_TIME_RULES_RD = [
-    (re.compile(r'^(\d+)\s+mo\s+ago$', re.I), lambda m: relativedelta(months=int(m.group(1)))),
+    (re.compile(r'^(\d+)\s+(?:mo|months?)' + _UNIT_DOT + r'\s+ago$', re.I),
+     lambda m: relativedelta(months=int(m.group(1)))),
     (re.compile(r'^Last\s+mo$', re.I), lambda m: relativedelta(months=1)),
 ]
 
@@ -462,86 +527,51 @@ def _time_status_to_timestamp(time_status: str, base_time: Optional[datetime] = 
 
 def sanitize_device_data(device_data: Dict) -> Optional[Dict]:
     """
-    Clean up parsed device data from the Swift extractor.
+    Validate a device row from the Swift extractor and decide whether to store it.
 
-    Fixes known issues in parseDeviceInfo():
-    1. Decimal distances (e.g. "0,8 km") are split on the comma, leaving
-       timeStatus="0" and distance="8 km" instead of the real values.
-    2. The real time status ("8 mo ago") gets appended to the location text.
-    3. "No location found" entries are noise and should be skipped.
-    4. When there's no distance in the raw data, the parser puts the time
-       status in the distance field and a city name in the timeStatus field.
-    5. Relative time statuses ("15 min ago") are converted to absolute timestamps
-       and stored in the location_timestamp field.
+    This used to repair the extractor's output as well: the old parser split one
+    comma-joined accessibility string, so a decimal distance like "0,8 km" tore in
+    half and the real time status ended up glued to the location. The macOS 26+
+    extractor reads each field from its own accessibility element, so there is
+    nothing left to repair — only to validate.
+
+    Rules:
+    1. Rows with no location are skipped (has_location false, or empty location).
+    2. "Paused" means updates are suspended, but the last known location is still
+       good — only skip when there is no location to go with it.
+    3. Stale rows (hours/days/weeks/months old) are not real location updates.
+    4. Relative time ("15 min. ago") becomes an absolute location_timestamp.
 
     Args:
-        device_data: Dict with keys name, location, timeStatus, distance, rawText
+        device_data: Row dict from the extractor — name, location, time_status,
+                     distance, proximity, has_location, battery.
 
     Returns:
-        Cleaned dict, or None if the record should be skipped entirely.
+        The dict, possibly with location_timestamp added, or None to skip the row.
     """
-    location = device_data.get('location', '')
-    time_status = device_data.get('timeStatus', '')
-    distance = device_data.get('distance', '')
+    location = (device_data.get('location') or '').strip(', ')
+    time_status = device_data.get('time_status') or ''
 
-    # Skip "No location found" — these are noise
-    if location == 'No location found' or location == 'Unknown':
+    # The extractor tells us outright when a row has no location ("No location
+    # found", or a bare "Paused" with nothing else).
+    if device_data.get('has_location') is False:
         return None
 
-    # "Paused" means location sharing is not actively refreshing, but the
-    # last known location is still valid.  Only skip if there is no location.
-    if time_status == 'Paused' and (not location or location == 'No location found'):
+    if not location or location in ('No location found', 'Unknown'):
+        return None
+
+    if time_status == 'Paused' and not location:
         return None
 
     # Skip stale records — old cached data, not a real location update
     if _STALE_TIME_RE.match(time_status):
         return None
 
-    # Bug 1: Decimal-distance parsing bug.
-    # When timeStatus is a bare number (e.g. "0") and distance looks like "8 km",
-    # the actual distance was "0,8 km" and the real time status is hiding at the
-    # end of the location string.
-    if time_status.isdigit() and _DISTANCE_NUM_RE.match(distance):
-        actual_distance = f"{time_status},{distance}"
-
-        # Try to extract the real time status from the location tail
-        match = _TIME_SUFFIX_RE.search(location)
-        if match:
-            actual_time_status = match.group(1)
-            actual_location = location[:match.start()].rstrip(', ')
-            device_data['location'] = actual_location
-            device_data['timeStatus'] = actual_time_status
-            device_data['distance'] = actual_distance
-        else:
-            # Can't find time in location — just fix the distance
-            device_data['distance'] = actual_distance
-            device_data['timeStatus'] = 'Unknown'
-
-    # Bug 2: No-distance case.
-    # When Find My doesn't show distance, the parser puts the time in the
-    # distance field and a location part (city) in the timeStatus field.
-    # e.g. timeStatus="Ghent", distance="15 min ago"
-    elif _TIME_VALUE_RE.match(distance) and not _TIME_VALUE_RE.match(time_status):
-        # Reassemble location to include the misplaced city name
-        if location:
-            device_data['location'] = f"{location}, {time_status}"
-        else:
-            device_data['location'] = time_status
-        device_data['timeStatus'] = distance
-        device_data['distance'] = '-'
-
-    # Convert relative time status to absolute timestamp
-    location_timestamp = _time_status_to_timestamp(device_data.get('timeStatus', ''))
+    location_timestamp = _time_status_to_timestamp(time_status)
     if location_timestamp:
         device_data['location_timestamp'] = location_timestamp
 
-    # Final cleanup: strip stray trailing commas/spaces from location
-    device_data['location'] = device_data['location'].strip(', ')
-
-    # Don't store empty locations
-    if not device_data['location']:
-        return None
-
+    device_data['location'] = location
     return device_data
 
 

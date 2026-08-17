@@ -4,51 +4,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AirTrackr is a macOS application that tracks Apple AirTag, device, and people locations over time. It uses a Swift binary that reads the Find My app via macOS Accessibility APIs and stores location history in an SQLite database. A FastAPI REST API and Vue.js dashboard provide access to the data.
+AirTrackr tracks Apple AirTag, device, and people locations over time. A Swift binary reads the Find My app through the macOS Accessibility APIs and stores location history in SQLite. A FastAPI REST API and a vanilla-JS dashboard expose the data.
+
+Everything runs locally on this Mac. (Through mid-2026 it ran on a remote iMac; that deployment is retired and its scripts have been removed.)
 
 ## Technology Stack
 
-- **Python 3.13** (via pyenv, with venv)
-- **Swift** — compiled universal binary for macOS Accessibility API extraction
-- **SQLite** — data storage (airtracker.db + geocoding_cache.db)
-- **FastAPI/Uvicorn** — REST API server (port 8001)
-- **Vue.js/Vite** — web dashboard (port 3000, uses Bun)
-- **Nominatim (OpenStreetMap)** — geocoding with local cache
-- **AppleScript** — Find My tab automation
+- **Python 3.13+** (3.14 locally, via venv)
+- **Swift** — universal binary (Intel + Apple Silicon) for Accessibility extraction
+- **SQLite** — `database/airtracker.db`
+- **FastAPI/Uvicorn** — REST API on port 8001
+- **Vanilla JS + Vite + Leaflet** — dashboard on port 3000 (built with Bun)
+- **Nominatim (OpenStreetMap)** — geocoding, with a local cache table
 
 ## Project Structure
 
 ```
 airtrackr/
-├── orchestrated_tracker.py   # Main tracker: cycles People/Devices/Items tabs
-├── swift_tracker.py          # Simpler tracker (single tab, no automation)
+├── orchestrated_tracker.py   # Main tracker: cycles People/Devices/Items/Me
 ├── swift_api.py              # FastAPI REST API server
-├── findmy_automation.py      # AppleScript tab switching (Cmd+1/2/3)
+├── db.py                     # Schema, migrations, shared connection
+├── findmy_automation.py      # Find My process lifecycle (no longer switches tabs)
 ├── geocoding.py              # Nominatim geocoding with caching
-├── health_check.py           # Database health monitoring
+├── enrichment.py             # Distance from home, trips, visits
+├── retention.py              # Aggregates old rows into summaries
 ├── database_maintenance.py   # Schema cleanup & optimization
-├── config.json               # App configuration
+├── config.json               # App configuration (gitignored)
 │
 ├── swift/
-│   ├── airtag_extractor       # Compiled universal binary (Intel + ARM)
-│   ├── airtag_extractor.swift # Source code
+│   ├── airtag_extractor       # Compiled universal binary
+│   ├── airtag_extractor.swift # Source
+│   ├── ax_dump.swift          # Dumps Find My's accessibility tree (see below)
 │   └── build_universal.sh     # Build script
 │
-├── dashboard/                 # Vue.js/Vite frontend
-│   ├── src/                   # Source files
-│   ├── dist/                  # Production build
-│   └── package.json           # Bun dependencies
-│
-├── database/
-│   ├── airtracker.db          # Main database
-│   └── geocoding_cache.db     # Geocoding lookup cache
-│
-├── logs/                      # Runtime logs (tracker, api, dashboard)
-├── venv/                      # Python virtual environment
-├── start_all.sh               # Launch everything
-├── start_servers.sh           # API + Dashboard only
-├── start_tracker.sh           # Tracker only
-└── stop_servers.sh            # Stop all services
+├── dashboard/                 # Vite frontend (dist/ is gitignored)
+├── launchd/                   # LaunchAgent templates + install.sh
+├── database/                  # SQLite (gitignored)
+└── logs/                      # Runtime logs (gitignored)
 ```
 
 ## Common Commands
@@ -57,20 +49,24 @@ airtrackr/
 # Setup
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+swift/build_universal.sh
 
-# Start everything (API + Dashboard + Tracker)
-./start_all.sh
-
-# Or start components individually
-source venv/bin/activate
-uvicorn swift_api:app --host 0.0.0.0 --port 8001      # API
-cd dashboard && bun run dev                              # Dashboard
-python orchestrated_tracker.py                           # Tracker
-
-# Stop all services
+# Run everything
+./start_all.sh          # API + dashboard + tracker
 ./stop_servers.sh
 
-# Database access
+# Or individually
+venv/bin/uvicorn swift_api:app --host 127.0.0.1 --port 8001
+cd dashboard && bun run dev
+venv/bin/python orchestrated_tracker.py --schedule 5
+
+# Inspect one pass without writing anything
+venv/bin/python orchestrated_tracker.py --dry-run
+
+# Run as background services
+./launchd/install.sh            # install + start
+./launchd/install.sh --uninstall
+
 sqlite3 database/airtracker.db
 ```
 
@@ -78,93 +74,106 @@ sqlite3 database/airtracker.db
 
 ```
 Find My app (macOS)
-    │
-    ├── AppleScript tab automation (Cmd+1/2/3)
-    │
+    │  Accessibility APIs — the Swift binary presses the tab button,
+    │  confirms the switch landed, then reads the rows
     ▼
-Swift airtag_extractor (Accessibility APIs → JSON)
-    │
-    ▼
-orchestrated_tracker.py (Python orchestration)
-    │
-    ├── Geocoding (Nominatim + cache)
-    │
-    ▼
-SQLite Database
-    │
-    ▼
-FastAPI REST API (port 8001)
-    │
-    ▼
-Vue.js Dashboard (port 3000)
+swift/airtag_extractor  ──JSON──▶  orchestrated_tracker.py
+                                        │
+                                        ├── geocoding (Nominatim + cache)
+                                        ├── enrichment (trips, visits)
+                                        ▼
+                                   SQLite ──▶ FastAPI :8001 ──▶ dashboard :3000
 ```
 
-## Database Schema
+## The Swift extractor
 
-Two main tables:
-- **swift_locations** — all location records (device_name, location, time_status, distance, lat/lon, device_type, timestamp)
-- **swift_devices** — device summary (device_name, first_seen, last_seen, last_location, update_count, device_type)
+`swift/airtag_extractor` is the piece that breaks when Apple changes Find My. It:
 
-Indexes on: device_name, timestamp DESC, extracted_at, device_type.
+- switches tabs itself (`--tab people|devices|items|me`) and **verifies** the switch
+  landed before reading, so rows can never be filed under the wrong `device_type`
+- exits with a specific code per failure — never exits 0 on failure:
 
-## API Endpoints
+  | code | meaning |
+  |------|---------|
+  | 0 | rows extracted |
+  | 2 | Accessibility permission missing |
+  | 3 | Find My not running (pass `--launch`) |
+  | 4 | running but no window |
+  | 5 | tab switch failed |
+  | 6 | tab verified but empty (normal for Me) |
+  | 7 | unexpected AX error |
+  | 64 | bad arguments |
 
-Base URL: `http://localhost:8001`
-
-- `GET /health` — health check
-- `GET /devices` — list all devices
-- `GET /devices/{name}` — device details
-- `GET /devices/{name}/history` — location history
-- `GET /locations/latest` — latest location per device
-- `GET /locations/search` — search locations
-- `GET /stats/{device_name}` — device statistics
-- `GET /docs` — Swagger UI
-
-## Key Notes
-
-- The Swift extractor requires Accessibility permissions in System Preferences
-- Find My app must be open for the tracker to work
-- Geocoding uses a 1.1s rate limit for Nominatim (free tier)
-- The orchestrated tracker cycles through all 3 tabs in ~3 minutes
-- Dashboard uses Google Maps iframe for location display
-
-## CRITICAL: iMac Remote Access Safety
-
-The tracking runs on a remote iMac (evelyn@192.168.50.6) that is physically located in another office. **Auto-login is NOT configured**, so if the machine shuts down or logs out, it requires physical access to recover.
-
-### NEVER run these commands on the iMac:
-- `sudo shutdown` — macOS has NO dry-run flag, it executes immediately
-- `sudo reboot` or `sudo /sbin/shutdown -r` — same issue
-- `osascript -e 'tell application "System Events" to log out'` — will log out and require physical login
-- `launchctl reboot` — will restart the login session
-
-### Safe alternatives for testing:
-- Use `echo "would run: <command>"` instead of actually running dangerous commands
-- Always ask the user before running any shutdown/reboot/logout commands
-- Use the `/restart-imac` skill which has proper safeguards
-
-### Recovery watchdog (scripts/recovery_watchdog.sh)
-The watchdog monitors tracking health and can trigger logout/reboot for recovery.
-**This requires auto-login to be configured first** — see setup instructions below.
-
-### TODO: Enable auto-login
-Before the watchdog can safely use logout/reboot recovery, run on the iMac:
 ```bash
-sudo sysadminctl -autologin set -userName evelyn -password <PASSWORD>
+swift/airtag_extractor --tab items --launch --pretty
+swift/airtag_extractor --tab people --include-raw   # show each row's raw AX text
 ```
 
-### Wake-on-LAN (for sleep recovery only)
+### When Find My changes again
 
-The iMac has Wake-on-LAN enabled (`pmset -a womp 1`). This only works when the Mac is **sleeping**, not after a full shutdown.
+Dump the live accessibility tree first — never guess at the structure:
 
-**MAC addresses** (try all three):
-- `BE:1F:49:CD:A7:0C`
-- `2E:AC:B9:A9:1A:5F`
-- `DA:77:6A:89:EE:20`
-
-**To wake the iMac from sleep** (run from jump server):
 ```bash
-ssh roel@kumulus.11ways.be 'wakeonlan BE:1F:49:CD:A7:0C; wakeonlan 2E:AC:B9:A9:1A:5F; wakeonlan DA:77:6A:89:EE:20'
+swift swift/ax_dump.swift        # runs directly, no build step
 ```
 
-**Note:** WoL does NOT work after `shutdown -h` (full power off). The Mac must be in sleep mode for WoL to work.
+Current structure (Find My 5.0, macOS 26/27) and the assumptions that depend on it:
+
+- Find My is a **Mac Catalyst** app. Its tree is UIKit-shaped, and **element depth
+  is not stable between reads** — navigate structurally, never by index or depth.
+- `AXGroup id="CardContainerView"` is the only anchor relied on. Scoping to it is
+  what excludes the map subtree (pins are `AXGenericElement` siblings), so no
+  string blacklist is needed.
+- A row is any element whose children carry `AXIdentifier == "ListEntityRow"`.
+- Row fields live in separate `AXStaticText` children; the location line joins
+  place/time/battery with `·` (U+00B7). Fields are classified by shape, not position.
+- Tabs are `AXRadioButton` + `AXSubrole AXTabButton`, with `AXValue` 1/0 for selected.
+- `AXHeading` under `AXGroup id="PrimaryLabel"` names the active tab.
+
+### Two behaviours that are easy to get wrong
+
+1. **Find My must be frontmost for a tab switch.** `AXUIElementPerformAction(…, kAXPressAction)`
+   on a backgrounded Find My returns `.success` and does nothing at all. The
+   extractor activates the app before pressing. `--no-activate` disables that, and
+   then tab switching will not work.
+2. **Find My only builds its window when activated.** Launched in the background it
+   sits there with zero accessible windows. `--launch` reopens it to recover.
+
+Consequence: the tracker steals focus for a moment on each cycle. That is inherent
+to reading Find My this way.
+
+## Database
+
+Main tables: `swift_locations` (every reading) and `swift_devices` (per-device summary),
+plus `geocoding_cache`, `trips`, `visits`, `zones`, `location_summaries`.
+
+Schema changes go in `db.py` as a numbered `_migrate_to_vN`, with `SCHEMA_VERSION`
+bumped; `init_schema()` applies whatever is pending via `PRAGMA user_version`.
+
+`DB_PATH` is anchored to the repo (override with `AIRTRACKR_DB`). It used to be
+relative, which silently created a second empty database when the process was
+started from another directory.
+
+Known limitation: `swift_devices.device_name` is `UNIQUE`, but Find My legitimately
+shows duplicate names (two "Roel's Backpack", two "Left Bud"). Both rows are stored
+in `swift_locations`; they collapse to one in `swift_devices`. The accessibility
+tree exposes no stable per-row identifier to key on.
+
+## API
+
+Base URL `http://localhost:8001`, routes under `/api/v1` (unprefixed paths redirect).
+`GET /docs` for Swagger.
+
+Auth is via the `X-API-Key` header, read from `AIRTRACKR_API_KEY` or a `.api_key`
+file. **If neither exists, authentication is silently disabled.** The dashboard
+reads the same key from `dashboard/.env` as `VITE_API_KEY`.
+
+Vite inlines that key into the built bundle, which is why `dashboard/dist/` is
+gitignored. Do not commit it.
+
+## Notes
+
+- The Swift extractor needs Accessibility permission, granted **per executable** —
+  a grant to Terminal does not cover a LaunchAgent.
+- Geocoding is rate-limited to 1.1s per request (Nominatim free tier).
+- A full cycle over the four tabs takes ~90 seconds.

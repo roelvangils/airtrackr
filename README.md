@@ -59,7 +59,7 @@ Go to **System Settings > Privacy & Security > Accessibility** and add your term
 ```
 
 This launches:
-- **Tracker** — collects location data every ~3 minutes
+- **Tracker** — cycles People / Devices / Items / Me, about 90 seconds per pass
 - **API** — REST server at http://localhost:8001
 - **Dashboard** — web UI at http://localhost:3000
 
@@ -69,14 +69,12 @@ This launches:
 - **API docs**: http://localhost:8001/docs
 - **Stop all**: `./stop_servers.sh`
 
-### 5. Backfill Historical Data (optional)
+### 5. Check a Single Pass (optional)
 
-If you have existing data from before the enrichment features, run:
+To see exactly what the tracker reads without writing anything to the database:
 
 ```bash
-source venv/bin/activate
-python backfill_enrichment.py --dry-run   # Preview what will change
-python backfill_enrichment.py             # Run all enrichment steps
+venv/bin/python orchestrated_tracker.py --dry-run
 ```
 
 ## Architecture
@@ -84,11 +82,10 @@ python backfill_enrichment.py             # Run all enrichment steps
 ```
 Find My app (macOS)
     |
-    +-- AppleScript tab automation (Cmd+1/2/3)
-    |
     v
 Swift airtag_extractor (Accessibility APIs -> JSON)
-    |
+    |  switches tabs itself and verifies the switch landed
+    |  before reading, so rows can't be filed under the wrong type
     v
 orchestrated_tracker.py (Python orchestration)
     |
@@ -105,7 +102,9 @@ FastAPI REST API (:8001)
 Vanilla JS Dashboard (:3000)
 ```
 
-The Swift binary reads device names, locations, distances, and timestamps directly from the Find My UI. No screenshots or OCR needed.
+The Swift binary reads device names, locations, distances, battery and timestamps directly from the Find My UI. No screenshots or OCR needed.
+
+Find My must be frontmost for a tab switch to register, so the extractor briefly brings it to the front on each cycle. See CLAUDE.md for the accessibility-tree details and for how to diagnose the next time Apple changes Find My.
 
 ## API Endpoints
 
@@ -183,23 +182,27 @@ sqlite3 database/airtracker.db "INSERT INTO location_aliases (alias, address) VA
 
 **Option 2 — macOS LaunchAgent:**
 
-Create `~/Library/LaunchAgents/com.airtrackr.plist` to auto-start on login. See `setup.sh` for details.
+```bash
+./launchd/install.sh              # install + start the API and tracker agents
+./launchd/install.sh --uninstall  # stop and remove them
+```
+
+The tracker needs Accessibility permission, and macOS grants it per executable — a grant to Terminal does not cover a LaunchAgent. macOS prompts on the first cycle; until it's granted, the extractor exits 2 and says so in `logs/tracker.log`.
 
 ## Project Structure
 
 ```
 airtrackr/
 ├── orchestrated_tracker.py   # Main tracker with tab cycling + enrichment
-├── swift_tracker.py          # Simple single-tab tracker
 ├── swift_api.py              # FastAPI REST API
-├── db.py                     # Shared database module (schema, migrations, sanitization)
+├── db.py                     # Shared database module (schema, migrations, validation)
 ├── enrichment.py             # Distance from home, trip detection, visit tracking
 ├── geocoding.py              # Nominatim geocoding + structured addresses + reverse geocoding
 ├── retention.py              # Data aggregation (raw -> hourly -> daily)
-├── backfill_enrichment.py    # Retroactive data enrichment for historical records
-├── findmy_automation.py      # AppleScript tab automation
+├── findmy_automation.py      # Find My process lifecycle
 ├── config.json               # Configuration
-├── swift/                    # Swift extractor (source + compiled binary)
+├── swift/                    # Swift extractor (source + compiled binary + ax_dump)
+├── launchd/                  # LaunchAgent templates + install.sh
 ├── dashboard/                # Vanilla JS / Vite frontend
 ├── database/                 # SQLite database
 ├── logs/                     # Runtime logs

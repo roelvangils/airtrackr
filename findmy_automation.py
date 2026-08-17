@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-Find My Tab Automation Module
+Find My app lifecycle helpers.
 
-This module handles automatic tab switching in the Find My app
-to enable comprehensive tracking of People, Devices, and Items.
+This module used to drive tab switching too, via AppleScript menu clicks
+(View → People/Devices/Items). As of the macOS 26+ rewrite the Swift extractor
+switches tabs itself by sending AXPress to the tab button and confirming the
+switch landed, so nothing here is on the tab-switching path any more — see
+swift/airtag_extractor.swift. What remains in use is process lifecycle:
+ensure_find_my_running(), restart_find_my(), and the stuck-window recovery.
 
-Uses AppleScript menu clicks (View → People/Devices/Items) because
-keyboard shortcuts (Cmd+1/2/3) are unreliable on headless Macs.
+The AppleScript tab helpers below (switch_to_tab, get_active_tab,
+verify_tab_switch, activate_find_my) are retained for one release as a fallback
+and are no longer called by orchestrated_tracker.py. Note that get_active_tab is
+already broken on macOS 27: AXMenuItemMarkChar now returns "missing value" for
+every item, so it can never identify the active tab.
 """
 
 import subprocess
@@ -14,7 +21,8 @@ import time
 import logging
 from typing import Literal
 
-DeviceType = Literal['person', 'device', 'item']
+# 'me' is the fourth tab Find My gained in the macOS 26 rewrite.
+DeviceType = Literal['person', 'device', 'item', 'me']
 
 logger = logging.getLogger(__name__)
 

@@ -1,10 +1,14 @@
-Pillow==11.0.0
+# Runtime dependencies for AirTrackr (Python 3.13+).
+#
+# Removed 2026-08: Pillow, pytesseract, fuzzywuzzy and rapidfuzz. The first two
+# were left over from the screenshot/OCR approach that the Swift accessibility
+# extractor replaced; fuzzywuzzy has been unmaintained since 2020 and neither
+# fuzzy matcher was imported anywhere.
+
 schedule==1.2.2
-python-dateutil==2.9.0
-pytesseract==0.3.13
+python-dateutil==2.9.0.post0
 requests==2.32.3
-fuzzywuzzy==0.18.0
-rapidfuzz==3.13.0
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-pydantic==2.10.0
+
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.12.0

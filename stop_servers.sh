@@ -58,8 +58,6 @@ pkill -f "bun.*run.*dev" 2>/dev/null && echo "  • Killed dashboard processes" 
 # Kill any orchestrated_tracker.py processes
 pkill -f "python.*orchestrated_tracker.py" 2>/dev/null && echo "  • Killed tracker processes" || true
 
-# Kill any swift_tracker.py processes (old tracker)
-pkill -f "python.*swift_tracker.py" 2>/dev/null && echo "  • Killed old tracker processes" || true
 
 echo ""
 echo -e "${GREEN}✅ All services stopped${NC}"

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AirTrackr REST API.
+
+  Do not load this file directly — it contains @@REPO@@ placeholders.
+  Run ./launchd/install.sh, which fills them in and installs into
+  ~/Library/LaunchAgents.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.airtrackr.api</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@@REPO@@/venv/bin/uvicorn</string>
+        <string>swift_api:app</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8001</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@@REPO@@</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Back off instead of respawning in a tight loop on a crash at startup -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>@@REPO@@/logs/api.log</string>
+    <key>StandardErrorPath</key>
+    <string>@@REPO@@/logs/api.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Absolute so the API never depends on the working directory -->
+        <key>AIRTRACKR_DB</key>
+        <string>@@REPO@@/database/airtracker.db</string>
+    </dict>
+</dict>
+</plist>

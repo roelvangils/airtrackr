@@ -33,3 +33,10 @@ dashboard/.env
 .idea/
 *.swp
 *.swo
+# Dashboard build output — regenerate with `cd dashboard && bun run build`.
+# Never commit it: Vite inlines VITE_API_KEY into the bundle.
+dashboard/dist/
+
+# Debug output from the old screenshot/OCR pipeline
+temp_regions/
+dashboard/node_modules/

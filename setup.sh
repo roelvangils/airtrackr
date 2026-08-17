@@ -37,9 +37,9 @@ echo -e "${GREEN}3. Upgrading pip...${NC}"
 pip install --upgrade pip
 
 echo ""
-echo -e "${GREEN}4. Installing dependencies with Python 3.14 compatibility...${NC}"
-# Set compatibility flag for pydantic-core to work with Python 3.14
-export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+echo -e "${GREEN}4. Installing dependencies...${NC}"
+# pydantic 2.12+ ships cp314 wheels, so the old PYO3_USE_ABI3_FORWARD_COMPATIBILITY
+# workaround (which forced a Rust source build) is no longer needed.
 pip install -r requirements.txt
 
 echo ""
@@ -50,16 +50,21 @@ cd ..
 
 echo ""
 echo -e "${GREEN}6. Creating necessary directories...${NC}"
-mkdir -p database logs screenshots
+mkdir -p database logs
 
 echo ""
 echo -e "${GREEN}7. Setting up database...${NC}"
-python migrations/add_device_type.py 2>/dev/null || echo "   Database migration already applied or not needed"
+# Creates the schema and applies any pending migrations, tracked via PRAGMA user_version.
+python -c 'import db; db.init_schema()'
 
 echo ""
 echo -e "${GREEN}✅ Setup complete!${NC}"
 echo ""
 echo "🚀 You can now start AirTracker:"
-echo "   ./start_all.sh"
+echo "   ./start_all.sh                 # API + dashboard + tracker"
+echo "   ./launchd/install.sh           # or run them as background services"
+echo ""
+echo "⚠️  The tracker needs Accessibility permission, granted per executable."
+echo "   Check it works with:  ./swift/airtag_extractor --tab items --launch"
 echo ""
 echo "📚 Need help? Check DEBUGGING.md"

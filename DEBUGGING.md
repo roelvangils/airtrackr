@@ -1,210 +1,122 @@
-# AirTracker Debugging Guide
+# Debugging AirTrackr
 
-All services have detailed logging enabled to help you see exactly what's happening, especially with the Find My automation.
+Almost every failure is in extraction — Find My changing shape underneath us. Work
+outward from the Swift binary; if that's healthy, the Python layers usually are too.
 
-## Logging Levels
-
-All components are configured with **DEBUG** or **INFO** level logging:
-
-### 1. Orchestrated Tracker (`orchestrated_tracker.py`)
-- **Level**: DEBUG
-- **Shows**:
-  - Tab switching events (Cmd+1, Cmd+2, Cmd+3)
-  - Wait times and pauses
-  - Device extraction results
-  - Database save operations
-  - Geocoding results
-  - All errors and warnings
-
-Example output:
-```
-2025-10-13 18:30:00 - __main__ - INFO - 🚀 STARTING ORCHESTRATED AIRTRACKER (SCHEDULED MODE)
-2025-10-13 18:30:05 - __main__ - INFO - Processing People tab...
-2025-10-13 18:30:05 - findmy_automation - INFO - Switched to person tab (Cmd+1)
-2025-10-13 18:30:10 - __main__ - INFO - Successfully extracted 2 person(s)
-2025-10-13 18:30:10 - __main__ - INFO - Found 2 person(s):
-2025-10-13 18:30:10 - __main__ - INFO -   - Peter Van Gils: Home (Now, Nearby)
-2025-10-13 18:30:10 - __main__ - DEBUG - Geocoded Home -> (51.234567, 3.456789)
-```
-
-### 2. Find My Automation (`findmy_automation.py`)
-- **Level**: DEBUG
-- **Shows**:
-  - AppleScript execution
-  - Find My app activation
-  - Tab switching commands
-  - All automation errors
-
-### 3. API Server (`swift_api.py`)
-- **Level**: INFO with access logs
-- **Shows**:
-  - All HTTP requests and responses
-  - API endpoint access
-  - Database queries
-  - Request timing
-
-Example output:
-```
-INFO:     127.0.0.1:54291 - "GET /devices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54291 - "GET /devices/counts HTTP/1.1" 200 OK
-```
-
-### 4. Dashboard (Vite)
-- **Shows**:
-  - Hot module reload (HMR) updates
-  - Build errors
-  - SCSS compilation
-
-## Viewing Logs
-
-### Automatic Console.app Integration
-
-When you run the launch scripts, **log files are automatically opened in Console.app** for easy monitoring:
-
-- `./start_servers.sh` opens `api.log` and `dashboard.log` in Console.app
-- `./start_tracker.sh` opens `tracker.log` in Console.app
-
-Console.app provides:
-- Real-time log updates
-- Search and filtering
-- Multiple logs in tabs
-- Syntax highlighting
-
-### Manual Log Monitoring
-
-You can also monitor logs manually from the terminal:
+## 1. Is extraction working?
 
 ```bash
-# Watch API logs
-tail -f logs/api.log
-
-# Watch Dashboard logs
-tail -f logs/dashboard.log
-
-# Watch Tracker logs
-tail -f logs/tracker.log
+swift/airtag_extractor --tab items --launch --pretty
+echo "exit: $?"
 ```
 
-### Opening Logs Manually in Console.app
+The exit code is the diagnosis:
+
+| code | meaning | what to do |
+|------|---------|------------|
+| 0 | rows extracted | extraction is fine, move to step 3 |
+| 2 | Accessibility permission missing | grant it to *this* process (see below) |
+| 3 | Find My not running | pass `--launch` |
+| 4 | running, no window | `--launch` reopens it |
+| 5 | tab switch failed | something is stealing focus; see step 2 |
+| 6 | tab verified but empty | normal for `me`; otherwise go to step 2 |
+| 7 | unexpected AX error | the tree changed mid-read; retry, then step 2 |
+
+Failures also print a JSON object with an `error` block explaining the cause, so
+`2>/dev/null` still tells you what went wrong.
+
+### Accessibility permission
+
+macOS grants this **per executable**. Granting it to Terminal does not cover
+`venv/bin/python` running under a LaunchAgent — that needs its own grant, under
+System Settings > Privacy & Security > Accessibility.
+
+## 2. Did Find My change?
+
+Dump the live tree rather than guessing:
 
 ```bash
-# Open specific log
-open -a Console logs/api.log
-
-# Open all logs
-open -a Console logs/*.log
+swift swift/ax_dump.swift                       # whole tree
+swift swift/ax_dump.swift | grep ListEntityRow  # just the device rows
+swift swift/ax_dump.swift --depth 6             # structure only
 ```
 
-### Running in Foreground (Most Verbose)
+Compare against the structure documented in `CLAUDE.md`. What matters:
 
-For maximum visibility during testing, run services in foreground:
+- `AXGroup id="CardContainerView"` still exists (everything is scoped to it)
+- rows still expose children with `AXIdentifier == "ListEntityRow"`
+- tabs are still `AXSubrole == "AXTabButton"` with `AXValue` 1/0
+- the location line still joins its parts with `·` (U+00B7)
+
+**Element depth is not stable between reads** — if you are counting levels to find
+something, that's the bug.
+
+To see the strings a row actually produced, before any parsing:
 
 ```bash
-# Terminal 1 - API Server
-source venv/bin/activate
-python swift_api.py
-
-# Terminal 2 - Dashboard
-cd dashboard
-bun run dev
-
-# Terminal 3 - Tracker (test mode)
-source venv/bin/activate
-python orchestrated_tracker.py --single-cycle
+swift/airtag_extractor --tab items --include-raw --pretty
 ```
 
-This way you see all output directly in the terminal.
+Rows the parser can't classify appear in the top-level `warnings` array rather than
+being dropped silently.
 
-## Debugging Automation Issues
-
-### Test Tab Automation Separately
+## 3. Is the tracker storing what it reads?
 
 ```bash
-source venv/bin/activate
-python findmy_automation.py
+venv/bin/python orchestrated_tracker.py --dry-run
 ```
 
-This will:
-1. Check if Find My is running
-2. Try to launch it if not
-3. Cycle through all three tabs
-4. Show detailed logging for each step
+Reads one full cycle and prints what it *would* write, touching nothing. If
+extraction is fine but rows aren't landing, the difference is in
+`db.sanitize_device_data`, which deliberately skips:
 
-### Test Single Tracking Cycle
+- rows with no location (`has_location: false`)
+- stale rows — hours, days, weeks or months old
+- a bare `Paused` with no location attached
+
+`logs/tracker.log` records each skip at DEBUG level.
+
+## 4. Logs
 
 ```bash
-source venv/bin/activate
-python orchestrated_tracker.py --single-cycle
+tail -f logs/tracker.log     # tracker, INFO and above
+tail -f logs/api.log         # API access + errors
 ```
 
-This runs one complete cycle and exits, perfect for debugging.
+The tracker logs the tab it *verified* it read, which is what `device_type` is
+stored from. A line like
 
-### Common Issues and Solutions
+```
+Requested Items but extractor verified 'Devices'; storing rows as 'device'
+```
 
-**Problem**: "Failed to ensure Find My is running"
-- **Solution**: Open Find My app manually before starting the tracker
-- **Command**: `open -a "Find My"`
+means Find My handed us a different tab than asked for — logged, and stored
+correctly, rather than silently mislabelled.
 
-**Problem**: "Swift extractor not found"
-- **Solution**: Compile the Swift extractor
-- **Command**: `cd swift && ./build_universal.sh`
-
-**Problem**: Tab switching seems to work but no data extracted
-- **Solution**:
-  - Make sure Find My is the active (frontmost) app
-  - Increase `TAB_LOAD_TIME` in orchestrated_tracker.py if your Mac is slow
-  - Check that the Swift extractor binary has correct permissions: `chmod +x swift/airtag_extractor`
-
-**Problem**: API returning 404 for /devices/counts
-- **Solution**: Restart the API server to pick up code changes
-- **Command**: `./stop_servers.sh && ./start_servers.sh`
-
-## Log File Locations
-
-When using launch scripts:
-- `logs/api.log` - API server output
-- `logs/dashboard.log` - Dashboard/Vite output
-- `logs/tracker.log` - Orchestrated tracker output
-- `logs/api.pid` - API process ID
-- `logs/dashboard.pid` - Dashboard process ID
-- `logs/tracker.pid` - Tracker process ID
-
-## Performance Monitoring
-
-To see what's happening in real-time while the tracker runs:
+## 5. API and database
 
 ```bash
-# Watch database changes
-watch -n 5 'sqlite3 database/airtracker.db "SELECT device_type, COUNT(*) FROM swift_devices WHERE device_type IS NOT NULL GROUP BY device_type"'
-
-# Watch recent locations
-watch -n 5 'sqlite3 database/airtracker.db "SELECT device_name, device_type, location, time_status FROM swift_locations ORDER BY timestamp DESC LIMIT 10"'
+curl -H "X-API-Key: $AIRTRACKR_API_KEY" localhost:8001/api/v1/health
+sqlite3 database/airtracker.db "SELECT device_type, COUNT(*) FROM swift_locations GROUP BY device_type"
 ```
 
-## Troubleshooting Checklist
+Two things worth knowing:
 
-Before reporting issues, verify:
+- If neither `AIRTRACKR_API_KEY` nor `.api_key` exists, **auth is silently
+  disabled** — an unexpected 401 means the key is set but the client isn't sending
+  a matching one.
+- `DB_PATH` is anchored to the repo and overridable with `AIRTRACKR_DB`. If the API
+  reports zero devices, confirm it opened the database you think it did — `/health`
+  returns `database_path`.
 
-- [ ] Find My app is running and logged in
-- [ ] Swift extractor is compiled and executable
-- [ ] Database directory exists and is writable
-- [ ] Python virtual environment is activated
-- [ ] All required Python packages are installed
-- [ ] Accessibility permissions granted (if needed)
-- [ ] No firewall blocking localhost:8001 or localhost:3000
+## Known non-bugs
 
-## Quick Test Commands
-
-```bash
-# Test API health
-curl http://localhost:8001/health | python -m json.tool
-
-# Test device counts
-curl http://localhost:8001/devices/counts | python -m json.tool
-
-# Test dashboard is running
-curl -I http://localhost:3000
-
-# Check running services
-ps aux | grep -E "swift_api|bun run dev|orchestrated_tracker" | grep -v grep
-```
+- **Duplicate device names.** Find My genuinely shows two rows called
+  "Roel's Backpack" and two called "Left Bud". Both are stored in
+  `swift_locations`; `swift_devices` collapses them because `device_name` is
+  `UNIQUE`. The accessibility tree offers no stable per-row id to key on.
+- **Missing distance.** While a row refreshes, Find My replaces its distance label
+  with a spinner. `distance` is null on those reads and reappears on the next one.
+- **The `me` tab is empty.** Exit 6 there is expected.
+- **Find My comes to the front each cycle.** A tab press is silently ignored unless
+  the app is frontmost, so this is unavoidable when reading it this way.

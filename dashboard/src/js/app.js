@@ -84,11 +84,13 @@ class App {
             const countPeople = document.getElementById('count-people');
             const countDevices = document.getElementById('count-devices');
             const countItems = document.getElementById('count-items');
+            const countMe = document.getElementById('count-me');
 
             if (countAll) countAll.textContent = `(${counts.total})`;
             if (countPeople) countPeople.textContent = `(${counts.people})`;
             if (countDevices) countDevices.textContent = `(${counts.devices})`;
             if (countItems) countItems.textContent = `(${counts.items})`;
+            if (countMe) countMe.textContent = `(${counts.me ?? 0})`;
         } catch (error) {
             console.error('Failed to update filter counts:', error);
         }

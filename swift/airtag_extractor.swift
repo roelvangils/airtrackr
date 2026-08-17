@@ -1,420 +1,893 @@
-#!/usr/bin/env swift
+// airtag_extractor.swift
 //
-// AirTag Location Extractor
-// 
-// This tool uses macOS Accessibility API to extract AirTag location data
-// directly from the Find My app window, eliminating the need for screenshots.
+// Extracts People / Devices / Items / Me rows from the macOS Find My app via the
+// Accessibility APIs, and emits structured JSON on stdout.
 //
-// Requirements:
-// - macOS with Find My app
-// - Accessibility permissions for Terminal/iTerm
-// - Find My app open with "Items" tab selected
+// Targets Find My 5.0 on macOS 26+, which is a Mac Catalyst app. Its accessibility
+// tree looks like this (depth is NOT stable between reads — navigate structurally):
 //
-// Output: JSON array of device locations to stdout
+//   AXWindow id="SceneWindow"
+//   └ AXGroup sub=iOSContentGroup
+//     └ AXGroup id="FindMy.Application"
+//       └ AXGroup id="CardContainerView"        <- the only anchor we rely on
+//         ├ AXGroup
+//         │ ├ AXGroup id="PrimaryLabel"
+//         │ │ └ AXHeading desc="Items"          <- name of the active tab
+//         │ └ … └ AXGroup                       <- one per row; children carry
+//         │       ├ AXImage        id="ListEntityRow"    AXIdentifier "ListEntityRow"
+//         │       ├ AXStaticText   id="ListEntityRow"    <- name
+//         │       ├ AXStaticText   id="ListEntityRow"    <- proximity or distance
+//         │       └ AXStaticText   id="ListEntityRow"    <- "Place · Time · Battery"
+//         └ AXTabGroup
+//           └ 4x AXRadioButton sub=AXTabButton desc="People"|"Devices"|"Items"|"Me"
+//
+// Scoping the walk to CardContainerView is what keeps the map subtree out: pins are
+// AXGenericElement siblings ("Auto,Map pin", "My Location") and POIs are
+// AXGenericElement sub=AXMapItem id="VKPointFeature". No string blacklist needed.
 
 import Foundation
 import ApplicationServices
 import AppKit
 
-// MARK: - Data Models
+// MARK: - Exit codes
 
-/// Represents an AirTag or Find My device with its location information
-struct AirTagDevice: Codable {
+enum ExitCode: Int32 {
+    case ok = 0
+    case axNotTrusted = 2
+    case appNotRunning = 3
+    case noWindow = 4
+    case tabSwitchFailed = 5
+    case noRows = 6
+    case axError = 7
+    case usage = 64
+
+    var kind: String {
+        switch self {
+        case .ok: return "ok"
+        case .axNotTrusted: return "ax_not_trusted"
+        case .appNotRunning: return "app_not_running"
+        case .noWindow: return "no_window"
+        case .tabSwitchFailed: return "tab_switch_failed"
+        case .noRows: return "no_rows"
+        case .axError: return "ax_error"
+        case .usage: return "usage"
+        }
+    }
+}
+
+let schemaVersion = 2
+let findMyBundleID = "com.apple.findmy"
+
+func warn(_ message: String) {
+    FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
+}
+
+// MARK: - Accessibility helpers
+
+/// Every AX read funnels through here so `invalidUIElement` (-25202, the tree was
+/// rebuilt under us) stays distinguishable from "attribute simply absent".
+var sawStaleElement = false
+
+func copyAttr(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+    var value: CFTypeRef?
+    let err = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+    switch err {
+    case .success:
+        return value
+    case .invalidUIElement:
+        sawStaleElement = true
+        return nil
+    default:
+        return nil
+    }
+}
+
+func axString(_ element: AXUIElement, _ name: String) -> String? {
+    copyAttr(element, name) as? String
+}
+
+func axInt(_ element: AXUIElement, _ name: String) -> Int? {
+    (copyAttr(element, name) as? NSNumber)?.intValue
+}
+
+func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+    copyAttr(element, kAXChildrenAttribute as String) as? [AXUIElement] ?? []
+}
+
+func axRole(_ element: AXUIElement) -> String? { axString(element, kAXRoleAttribute as String) }
+func axSubrole(_ element: AXUIElement) -> String? { axString(element, kAXSubroleAttribute as String) }
+func axIdentifier(_ element: AXUIElement) -> String? { axString(element, kAXIdentifierAttribute as String) }
+func axDescription(_ element: AXUIElement) -> String? { axString(element, kAXDescriptionAttribute as String) }
+
+/// Description, falling back to value — Catalyst puts row text in AXDescription,
+/// but not every build is consistent about it.
+func axText(_ element: AXUIElement) -> String? {
+    let raw = axDescription(element) ?? axString(element, kAXValueAttribute as String)
+    guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+        return nil
+    }
+    return trimmed
+}
+
+let maxDepth = 40
+
+func findDescendant(_ element: AXUIElement, depth: Int = 0, where predicate: (AXUIElement) -> Bool) -> AXUIElement? {
+    if depth > maxDepth { return nil }
+    if predicate(element) { return element }
+    for child in axChildren(element) {
+        if let hit = findDescendant(child, depth: depth + 1, where: predicate) { return hit }
+    }
+    return nil
+}
+
+// MARK: - Text classification
+
+func regex(_ pattern: String) -> NSRegularExpression {
+    // Patterns are compile-time constants; a throw here is a programming error.
+    return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+}
+
+// Not a raw string: the \u{...} escapes must be resolved by Swift into real NBSP and
+// narrow-NBSP characters. ICU would not understand Swift's brace form if passed through.
+let distanceRE = regex("^([\\d.,\u{00A0}\u{202F} ]+?)\\s*(m|km|mi|ft|yd)$")
+let timeAgoRE = regex(#"^\d+\s*(min|mins|minute|minutes|hr|hrs|hour|hours|day|days|week|weeks|mo|month|months|yr|year|years)\.?\s+ago$"#)
+let timeWordRE = regex(#"^(now|just now|yesterday|paused)$"#)
+
+func matches(_ re: NSRegularExpression, _ s: String) -> Bool {
+    re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
+}
+
+/// U+00B7 MIDDLE DOT joins the segments of the location line.
+let separator: Character = "\u{00B7}"
+
+let noLocationLiterals: Set<String> = ["no location found", "location not available", "no location"]
+let proximityLiterals: Set<String> = ["nearby", "here", "with you"]
+let addressUnavailableLiterals: Set<String> = ["address unavailable", "no address found"]
+
+func isNoLocation(_ s: String) -> Bool { noLocationLiterals.contains(s.lowercased()) }
+func isProximity(_ s: String) -> Bool { proximityLiterals.contains(s.lowercased()) }
+func hasSeparator(_ s: String) -> Bool { s.contains(separator) }
+func isBattery(_ s: String) -> Bool { s.lowercased().contains("battery") }
+func isTime(_ s: String) -> Bool { matches(timeWordRE, s) || matches(timeAgoRE, s) }
+
+// MARK: - Distance
+
+struct Distance: Codable {
+    let value: Double
+    let unit: String
+    let text: String   // normalized, dot decimal — feeds the legacy `distance` TEXT column
+    let km: Double
+}
+
+let kmPerUnit: [String: Double] = ["m": 0.001, "km": 1.0, "mi": 1.609344, "ft": 0.0003048, "yd": 0.0009144]
+
+/// Parses the numeric part of a distance without NumberFormatter, which would make
+/// the result depend on the machine's locale. Find My renders in the user's locale
+/// ("1,3 km" here in Belgium, "1.3 km" in the US), so both are accepted.
+func parseNumber(_ raw: String) -> Double? {
+    var s = raw
+    for space in [" ", "\u{00A0}", "\u{202F}"] { s = s.replacingOccurrences(of: space, with: "") }
+    guard !s.isEmpty else { return nil }
+
+    let lastDot = s.lastIndex(of: ".")
+    let lastComma = s.lastIndex(of: ",")
+
+    // Whichever of . or , comes last is the decimal separator; the rest group digits.
+    var decimalIndex: String.Index?
+    switch (lastDot, lastComma) {
+    case let (dot?, comma?):
+        decimalIndex = dot > comma ? dot : comma
+    case let (dot?, nil):
+        decimalIndex = dot
+    case let (nil, comma?):
+        decimalIndex = comma
+    case (nil, nil):
+        decimalIndex = nil
+    }
+
+    // A separator followed by exactly 3 digits with no further separator is a
+    // thousands group ("1.234 km"), not a decimal point.
+    if let idx = decimalIndex {
+        let fractionDigits = s.distance(from: s.index(after: idx), to: s.endIndex)
+        if fractionDigits == 3 { decimalIndex = nil }
+    }
+
+    var normalized = ""
+    for (offset, ch) in zip(s.indices, s) {
+        if ch == "." || ch == "," {
+            if offset == decimalIndex { normalized.append(".") }
+            // otherwise: thousands separator, drop it
+        } else {
+            normalized.append(ch)
+        }
+    }
+    return Double(normalized)
+}
+
+func parseDistance(_ text: String) -> Distance? {
+    let range = NSRange(text.startIndex..., in: text)
+    guard let m = distanceRE.firstMatch(in: text, range: range),
+          let numberRange = Range(m.range(at: 1), in: text),
+          let unitRange = Range(m.range(at: 2), in: text) else { return nil }
+
+    guard let value = parseNumber(String(text[numberRange])) else { return nil }
+    let unit = String(text[unitRange]).lowercased()
+    guard let factor = kmPerUnit[unit] else { return nil }
+
+    // Trim a trailing ".0" so whole numbers read as "86 km", not "86.0 km".
+    let rendered = value == value.rounded() && abs(value) < 1e15
+        ? String(Int(value))
+        : String(value)
+
+    return Distance(value: value, unit: unit, text: "\(rendered) \(unit)", km: value * factor)
+}
+
+func isDistance(_ s: String) -> Bool { parseDistance(s) != nil }
+
+// MARK: - Model
+
+struct DeviceRow: Codable {
+    let index: Int
+    let name: String
+    let hasLocation: Bool
+    let location: String?
+    let locationParts: [String]
+    let addressUnavailable: Bool
+    let timeStatus: String?
+    let proximity: String?
+    let distance: Distance?
+    let battery: String?
+    let batteryRaw: String?
+    let favorite: Bool
+    let texts: [String]?   // only with --include-raw
+}
+
+struct ExtractionError: Codable {
+    let code: Int32
+    let kind: String
+    let message: String
+    let tabRequested: String?
+    let tabObserved: String?
+}
+
+struct Envelope: Codable {
+    let ok: Bool
+    let schemaVersion: Int
+    let tab: String?
+    let tabRequested: String?
+    let tabVerified: Bool
+    let extractedAt: String
+    let appPid: Int32?
+    let count: Int
+    let warnings: [String]
+    let devices: [DeviceRow]
+    let error: ExtractionError?
+}
+
+/// The pre-macOS-26 output shape, kept behind --format legacy for swift_tracker.py.
+struct LegacyDevice: Codable {
     let name: String
     let location: String
-    let timeStatus: String  // e.g., "Now", "5 min ago", "Paused"
-    let distance: String    // e.g., "0 km", "1.5 km", "-"
-    let rawText: String     // Original text for debugging
-    let extractedAt: Date
-    let batteryStatus: String?  // e.g., "Low", "Normal", nil if not available
-
-    var description: String {
-        let batteryStr = batteryStatus.map { ", Battery: \($0)" } ?? ""
-        return """
-        Device: \(name)
-          Location: \(location)
-          Status: \(timeStatus)
-          Distance: \(distance)\(batteryStr)
-        """
-    }
+    let timeStatus: String
+    let distance: String
+    let batteryStatus: String?
+    let extractedAt: String
 }
 
-// MARK: - Process Management
+// MARK: - Row parsing
 
-/// Find the process ID for a given application name
-/// - Parameter appName: The name of the application (e.g., "Find My")
-/// - Returns: Process ID if found, nil otherwise
-func getProcessID(forAppName appName: String) -> pid_t? {
-    let runningApps = NSWorkspace.shared.runningApplications
-    
-    // Try exact match first
-    if let app = runningApps.first(where: { $0.localizedName == appName }) {
-        return app.processIdentifier
-    }
-    
-    // Try bundle identifier match (more reliable)
-    if let app = runningApps.first(where: { 
-        $0.bundleIdentifier?.lowercased().contains(appName.lowercased()) == true 
-    }) {
-        return app.processIdentifier
-    }
-    
-    return nil
+struct ParsedRow {
+    let row: DeviceRow
+    let warnings: [String]
 }
 
-// MARK: - Device Information Parsing
+func parseRow(children: [AXUIElement], index: Int, includeRaw: Bool) -> ParsedRow? {
+    var warnings: [String] = []
+    var favorite = false
+    var texts: [String] = []
 
-/// Parse device information from Find My text format
-/// - Parameter text: Raw text from Find My UI element
-/// - Returns: Parsed AirTagDevice if format matches, nil otherwise
-func parseDeviceInfo(from text: String, batteryStatus: String? = nil) -> AirTagDevice? {
-    // Known patterns:
-    // 1. "Device Name, Location, Time, Distance" - e.g. "Auto, François Laurentplein, Ghent , 10 min ago, 0,7 km"
-    // 2. "Device Name, Location, Time, Distance" - e.g. "Black Valize, Home , 4 min ago, 0 km"
-    // 3. "Device Name, Location, Status, Distance" - e.g. "Black Valize, Home , Now, 0 km"
-    // 4. "Device Name, Location, Status, Distance" - e.g. "Black Valize, Home , Paused, 0 km"
-    // 5. "Device Name, Status" - e.g. "Backpack, Paused" (no location)
-    // 6. "Device Name, No location found"
-    
-    // Clean up the text and split by comma
-    let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    let components = trimmedText.split(separator: ",").map { 
-        $0.trimmingCharacters(in: .whitespaces) 
-    }
-    
-    // Need at least device name and one other component
-    guard components.count >= 2 else { return nil }
-    
-    let deviceName = components[0]
-    
-    // Case 1: Device with no location (2 components)
-    if components.count == 2 {
-        let status = components[1]
-        if status == "Paused" || status == "No location found" {
-            return AirTagDevice(
-                name: deviceName,
-                location: "No location found",
-                timeStatus: status,
-                distance: "-",
-                rawText: trimmedText,
-                extractedAt: Date(),
-                batteryStatus: batteryStatus
-            )
-        }
-    }
-    
-    // Helper: does this string look like a time status?
-    func looksLikeTime(_ s: String) -> Bool {
-        return s == "Now" || s == "Paused" || s == "Yesterday" ||
-               s.contains("ago") || s.hasPrefix("Last") ||
-               s.range(of: #"^\d+\s+(min|hours?|mo|days?|weeks?)"#, options: .regularExpression) != nil
-    }
-
-    // Case 2: Device with location + time + distance (4+ components)
-    // Format: "Name, Street, City, 10 min ago, 0,7 km"
-    if components.count >= 4 {
-        let lastComp = components[components.count - 1]
-
-        // Check if the last component is a valid distance (e.g., "0 km", "500 m")
-        let lastIsDistance = lastComp.range(of: #"^\d+\s*(km|m)$"#, options: .regularExpression) != nil
-
-        if lastIsDistance {
-            var actualDistance = lastComp
-            var timeStatusIndex = components.count - 2
-
-            // Check for split decimal distance (European comma: "0", "7 km" → "0,7 km")
-            let prevComp = components[components.count - 2]
-            if components.count >= 5 && prevComp.allSatisfy({ $0.isNumber }) {
-                actualDistance = "\(prevComp),\(lastComp)"
-                timeStatusIndex = components.count - 3
-            }
-
-            let actualTimeStatus = components[timeStatusIndex]
-            let locationParts = components[1..<timeStatusIndex]
-            let actualLocation = locationParts.joined(separator: ", ")
-
-            return AirTagDevice(
-                name: deviceName,
-                location: actualLocation.isEmpty ? "Unknown" : actualLocation,
-                timeStatus: actualTimeStatus,
-                distance: actualDistance,
-                rawText: trimmedText,
-                extractedAt: Date(),
-                batteryStatus: batteryStatus
-            )
+    for child in children {
+        let role = axRole(child)
+        if role == "AXImage" {
+            // A row that is mid-refresh swaps its distance label for a spinner
+            // ("Circular Progress Indicator"); that is normal, not an error.
+            if let d = axDescription(child), d.lowercased().contains("favorite") { favorite = true }
+        } else if role == "AXStaticText" {
+            if let t = axText(child) { texts.append(t) }
         }
     }
 
-    // Case 3: Device with location + time but NO distance (3+ components)
-    // Format: "Auto, François Laurentplein, Ghent, 15 min ago"
-    if components.count >= 3 {
-        let lastComp = components[components.count - 1]
+    guard !texts.isEmpty else { return nil }
 
-        if looksLikeTime(lastComp) {
-            let locationParts = components[1..<components.count - 1]
-            let location = locationParts.joined(separator: ", ")
-
-            return AirTagDevice(
-                name: deviceName,
-                location: location.isEmpty ? "Unknown" : location,
-                timeStatus: lastComp,
-                distance: "-",
-                rawText: trimmedText,
-                extractedAt: Date(),
-                batteryStatus: batteryStatus
-            )
-        }
+    // The name is the first text that isn't recognisably one of the other fields.
+    // Normally texts[0]; the guard is defensive against a reordered layout.
+    guard let nameIndex = texts.firstIndex(where: {
+        !isDistance($0) && !isProximity($0) && !isNoLocation($0) && !hasSeparator($0)
+    }) else {
+        warnings.append("row_\(index)_no_name")
+        return nil
     }
+    let name = texts[nameIndex]
 
-    return nil
-}
+    var hasLocation = false
+    var location: String?
+    var locationParts: [String] = []
+    var addressUnavailable = false
+    var timeStatus: String?
+    var proximity: String?
+    var distance: Distance?
+    var battery: String?
+    var batteryRaw: String?
 
-// MARK: - Accessibility API Extraction
+    for (i, text) in texts.enumerated() where i != nameIndex {
+        if let d = parseDistance(text) {
+            distance = d
+        } else if isNoLocation(text) {
+            hasLocation = false
+        } else if isProximity(text) {
+            proximity = text
+        } else if hasSeparator(text) {
+            // "Ghent · 14 min. ago · Quarter-Charged Battery"
+            let segments = text.split(separator: separator).map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty }
+            guard let place = segments.first else { continue }
 
-/// Extract AirTag devices from Find My window using Accessibility API
-/// - Parameter element: The AXUIElement to search within
-/// - Returns: Array of found AirTag devices
-func extractAirTagDevices(from element: AXUIElement) -> [AirTagDevice] {
-    var devices: [AirTagDevice] = []
-    var processedTexts = Set<String>() // Avoid duplicates
-    // Collect battery hints from AXImage elements (experimental)
-    var batteryHints: [String] = []
+            location = place
+            locationParts = segments
+            hasLocation = true
+            if addressUnavailableLiterals.contains(place.lowercased()) { addressUnavailable = true }
 
-    /// Recursively process UI elements
-    func processElement(_ elem: AXUIElement, depth: Int = 0) {
-        // Limit recursion depth to prevent infinite loops
-        guard depth < 20 else { return }
-
-        // Get element role
-        var role: CFTypeRef?
-        AXUIElementCopyAttributeValue(elem, kAXRoleAttribute as CFString, &role)
-        let roleStr = role as? String ?? ""
-
-        // Look for battery-related AXImage elements
-        if roleStr == "AXImage" {
-            var imgDesc: CFTypeRef?
-            if AXUIElementCopyAttributeValue(elem, kAXDescriptionAttribute as CFString, &imgDesc) == .success,
-               let imgStr = imgDesc as? String {
-                let lower = imgStr.lowercased()
-                if lower.contains("battery") || lower.contains("low") || lower.contains("critical") {
-                    // Normalize to a status string
-                    if lower.contains("critical") {
-                        batteryHints.append("Critical")
-                    } else if lower.contains("low") {
-                        batteryHints.append("Low")
-                    } else {
-                        batteryHints.append("Normal")
-                    }
+            var extras: [String] = []
+            for segment in segments.dropFirst() {
+                if isBattery(segment) {
+                    batteryRaw = segment
+                    battery = segment
+                        .replacingOccurrences(of: " Battery", with: "", options: .caseInsensitive)
+                        .trimmingCharacters(in: .whitespaces)
+                } else if isTime(segment) {
+                    timeStatus = segment
+                } else {
+                    extras.append(segment)
                 }
             }
-        }
-
-        // Look for static text elements (these contain device info)
-        if roleStr == "AXStaticText" {
-            // Try to get description (primary text source)
-            var desc: CFTypeRef?
-            if AXUIElementCopyAttributeValue(elem, kAXDescriptionAttribute as CFString, &desc) == .success,
-               let descStr = desc as? String,
-               !descStr.isEmpty {
-
-                // Check if this looks like device info and hasn't been processed
-                if descStr.contains(",") && !processedTexts.contains(descStr) {
-                    processedTexts.insert(descStr)
-
-                    // Filter out UI elements that aren't devices
-                    let isNotDevice = descStr.contains("Map pin") ||
-                                     descStr.contains("My Location") ||
-                                     descStr.hasPrefix("AXURL")
-
-                    if !isNotDevice, let device = parseDeviceInfo(from: descStr) {
-                        devices.append(device)
-                    }
-                }
+            // Forward-compat: an unrecognised trailing segment is almost certainly a
+            // time string in a form we haven't seen. Take it, but say so.
+            if timeStatus == nil, extras.count == 1, extras[0] == segments.last {
+                timeStatus = extras.removeFirst()
+                warnings.append("row_\(index)_time_status_unrecognized")
             }
-
-            // Also check value attribute as fallback
-            var value: CFTypeRef?
-            if AXUIElementCopyAttributeValue(elem, kAXValueAttribute as CFString, &value) == .success,
-               let valueStr = value as? String,
-               !valueStr.isEmpty && !processedTexts.contains(valueStr) {
-
-                if valueStr.contains(","), let device = parseDeviceInfo(from: valueStr) {
-                    processedTexts.insert(valueStr)
-                    devices.append(device)
-                }
+            if !extras.isEmpty {
+                location = ([place] + extras).joined(separator: ", ")
             }
-        }
-
-        // Recursively process children
-        var children: CFTypeRef?
-        if AXUIElementCopyAttributeValue(elem, kAXChildrenAttribute as CFString, &children) == .success,
-           let childArray = children as? [AXUIElement] {
-            for child in childArray {
-                processElement(child, depth: depth + 1)
-            }
-        }
-    }
-
-    processElement(element)
-
-    // Try to associate battery hints with devices (positional heuristic:
-    // if we found exactly as many hints as devices, pair them in order)
-    if !batteryHints.isEmpty && batteryHints.count == devices.count {
-        var enriched: [AirTagDevice] = []
-        for (i, device) in devices.enumerated() {
-            enriched.append(AirTagDevice(
-                name: device.name,
-                location: device.location,
-                timeStatus: device.timeStatus,
-                distance: device.distance,
-                rawText: device.rawText,
-                extractedAt: device.extractedAt,
-                batteryStatus: batteryHints[i]
-            ))
-        }
-        devices = enriched
-    }
-
-    // Remove duplicates based on device name
-    var uniqueDevices: [AirTagDevice] = []
-    var seenNames = Set<String>()
-
-    for device in devices {
-        if !seenNames.contains(device.name) {
-            seenNames.insert(device.name)
-            uniqueDevices.append(device)
-        }
-    }
-
-    return uniqueDevices
-}
-
-// MARK: - Main Execution
-
-func main() {
-    // Setup
-    printToStderr("AirTag Location Extractor")
-    printToStderr(String(repeating: "=", count: 50))
-    printToStderr("")
-    
-    // Check if Find My is running
-    var pid = getProcessID(forAppName: "Find My")
-    
-    if pid == nil {
-        printToStderr("⚠️  Find My app is not running. Attempting to open it...")
-        
-        // Open Find My app
-        let workspace = NSWorkspace.shared
-        let findMyURL = URL(fileURLWithPath: "/System/Applications/FindMy.app")
-        
-        // Use NSWorkspace to open Find My
-        let opened = workspace.open(findMyURL)
-        
-        if !opened {
-            printToStderr("❌ Failed to open Find My app")
-            print("[]")
-            exit(1)
-        }
-        
-        printToStderr("✅ Launching Find My app...")
-        
-        // Wait for app to launch (up to 10 seconds)
-        var attempts = 0
-        while attempts < 20 {
-            Thread.sleep(forTimeInterval: 0.5)
-            if let newPid = getProcessID(forAppName: "Find My") {
-                pid = newPid
-                printToStderr("✅ Find My app launched successfully (PID: \(newPid))")
-                
-                // Give it a bit more time to fully initialize
-                Thread.sleep(forTimeInterval: 2.0)
-                break
-            }
-            attempts += 1
-        }
-        
-        if pid == nil {
-            printToStderr("❌ Failed to launch Find My app after 10 seconds")
-            print("[]")
-            exit(1)
-        }
-    }
-    
-    guard let finalPid = pid else {
-        printToStderr("❌ Unable to get Find My process ID")
-        print("[]")
-        exit(1)
-    }
-    
-    printToStderr("✅ Found Find My app (PID: \(finalPid))")
-    
-    // Get Find My application element
-    let appElement = AXUIElementCreateApplication(finalPid)
-    
-    // Get all windows
-    var windows: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windows) == .success,
-          let windowArray = windows as? [AXUIElement],
-          !windowArray.isEmpty else {
-        printToStderr("❌ No windows found for Find My app")
-        print("[]")
-        exit(1)
-    }
-    
-    printToStderr("📍 Extracting AirTag locations from \(windowArray.count) window(s)...")
-    printToStderr("")
-    
-    // Extract devices from all windows (usually just one)
-    var allDevices: [AirTagDevice] = []
-    for window in windowArray {
-        let devices = extractAirTagDevices(from: window)
-        allDevices.append(contentsOf: devices)
-    }
-    
-    // Remove any remaining duplicates
-    let uniqueDevices = Array(Set(allDevices.map { $0.name }))
-        .compactMap { name in allDevices.first { $0.name == name } }
-        .sorted { $0.name < $1.name } // Sort by name for consistency
-    
-    // Report findings to stderr
-    if uniqueDevices.isEmpty {
-        printToStderr("⚠️  No AirTag devices found.")
-        printToStderr("Make sure the 'Items' tab is selected in Find My.")
-    } else {
-        printToStderr("Found \(uniqueDevices.count) device(s):")
-        printToStderr("")
-        
-        for (index, device) in uniqueDevices.enumerated() {
-            printToStderr("\(index + 1). \(device.description)")
-            printToStderr("")
-        }
-    }
-    
-    // Output JSON to stdout for parsing
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    encoder.dateEncodingStrategy = .iso8601
-    
-    do {
-        let jsonData = try encoder.encode(uniqueDevices)
-        if let jsonString = String(data: jsonData, encoding: .utf8) {
-            print(jsonString) // This goes to stdout
+        } else if isTime(text) {
+            // A row can carry a bare status with no place attached — Find My shows
+            // just "Paused" for items whose updates are suspended.
+            timeStatus = text
         } else {
-            print("[]")
+            // A bare place name with no separator, e.g. a row showing just "Home".
+            location = text
+            locationParts = [text]
+            hasLocation = true
+            warnings.append("row_\(index)_unclassified_single_segment")
         }
-    } catch {
-        printToStderr("❌ Failed to encode JSON: \(error)")
-        print("[]")
-        exit(1)
+    }
+
+    let row = DeviceRow(
+        index: index,
+        name: name,
+        hasLocation: hasLocation && location != nil,
+        location: location,
+        locationParts: locationParts,
+        addressUnavailable: addressUnavailable,
+        timeStatus: timeStatus,
+        proximity: proximity,
+        distance: distance,
+        battery: battery,
+        batteryRaw: batteryRaw,
+        favorite: favorite,
+        texts: includeRaw ? texts : nil
+    )
+    return ParsedRow(row: row, warnings: warnings)
+}
+
+// MARK: - Tree scanning
+
+/// Collects row groups by asking "do this element's children carry the ListEntityRow
+/// identifier?". Inverting the test this way means we never need AXUIElement to be
+/// Hashable, rows come out in document order, and nested groups can't double-count.
+func scanRows(_ element: AXUIElement, depth: Int = 0, into rows: inout [[AXUIElement]]) {
+    if depth > maxDepth { return }
+    let children = axChildren(element)
+    if children.contains(where: { axIdentifier($0) == "ListEntityRow" }) {
+        rows.append(children)
+        return   // this element IS a row; do not descend further
+    }
+    for child in children {
+        scanRows(child, depth: depth + 1, into: &rows)
     }
 }
 
-// MARK: - Extensions
-
-/// Simple stderr printing
-func printToStderr(_ message: String) {
-    fputs(message + "\n", stderr)
+func findCardContainer(pid: pid_t) -> AXUIElement? {
+    let app = AXUIElementCreateApplication(pid)
+    guard let windows = copyAttr(app, kAXWindowsAttribute as String) as? [AXUIElement] else { return nil }
+    for window in windows {
+        if let card = findDescendant(window, where: { axIdentifier($0) == "CardContainerView" }) {
+            return card
+        }
+    }
+    return nil
 }
 
-// Run the main function
-main()
+/// The Catalyst app is briefly unresponsive to AX right after launch or a tab press.
+func findCardContainerWithRetry(pid: pid_t, attempts: Int = 3) -> AXUIElement? {
+    for attempt in 0..<attempts {
+        if let card = findCardContainer(pid: pid) { return card }
+        if attempt < attempts - 1 { Thread.sleep(forTimeInterval: 0.2) }
+    }
+    return nil
+}
+
+func activeTabName(_ card: AXUIElement) -> String? {
+    guard let label = findDescendant(card, where: { axIdentifier($0) == "PrimaryLabel" }),
+          let heading = findDescendant(label, where: { axRole($0) == "AXHeading" }) else { return nil }
+    return axDescription(heading)
+}
+
+func tabButtons(_ card: AXUIElement) -> [(name: String, element: AXUIElement, selected: Bool)] {
+    var found: [(String, AXUIElement, Bool)] = []
+    func walk(_ element: AXUIElement, _ depth: Int) {
+        if depth > maxDepth { return }
+        if axSubrole(element) == "AXTabButton" || axRole(element) == "AXRadioButton" {
+            if axSubrole(element) == "AXTabButton", let name = axDescription(element) {
+                found.append((name, element, axInt(element, kAXValueAttribute as String) == 1))
+                return
+            }
+        }
+        for child in axChildren(element) { walk(child, depth + 1) }
+    }
+    walk(card, 0)
+    return found
+}
+
+func rowCount(pid: pid_t) -> Int {
+    guard let card = findCardContainer(pid: pid) else { return -1 }
+    var rows: [[AXUIElement]] = []
+    scanRows(card, into: &rows)
+    return rows.count
+}
+
+// MARK: - Tab control
+
+enum TabResult {
+    case ok(observed: String?)
+    case failed(message: String, observed: String?)
+}
+
+/// Presses the tab button and confirms the switch landed. Elements are re-resolved
+/// from the app on every poll: Catalyst rebuilds the tree on a tab change, so any
+/// reference cached across the press goes stale (-25202).
+///
+/// Find My must be activated before the press. AXPress on a tab button of a
+/// backgrounded Find My returns .success and then does nothing at all — verified on
+/// macOS 27 — so the return code cannot be trusted and the app has to be brought
+/// forward first. Activation is skipped when we are already on the target tab.
+func switchToTab(app: NSRunningApplication, target: String, waitSeconds: Double,
+                 activate: Bool) -> TabResult {
+    let pid = app.processIdentifier
+    guard let card = findCardContainerWithRetry(pid: pid) else {
+        return .failed(message: "could not locate CardContainerView", observed: nil)
+    }
+
+    let buttons = tabButtons(card)
+    guard let button = buttons.first(where: { $0.name.lowercased() == target.lowercased() }) else {
+        let available = buttons.map { $0.name }.joined(separator: ", ")
+        return .failed(message: "no tab button named '\(target)' (available: \(available))", observed: nil)
+    }
+
+    // Already there, and the heading agrees — nothing to do, and no need to steal
+    // focus for it.
+    if button.selected, activeTabName(card)?.lowercased() == target.lowercased() {
+        return .ok(observed: button.name)
+    }
+
+    if activate {
+        app.activate()
+        Thread.sleep(forTimeInterval: 0.8)
+        if !app.isActive {
+            warn("Find My did not come to the front; the tab press may not register")
+        }
+    }
+
+    // Re-resolve after activation — bringing the app forward can rebuild the tree.
+    guard let card = findCardContainerWithRetry(pid: pid),
+          let button = tabButtons(card).first(where: { $0.name.lowercased() == target.lowercased() }) else {
+        return .failed(message: "tab button disappeared after activating Find My", observed: nil)
+    }
+
+    let err = AXUIElementPerformAction(button.element, kAXPressAction as CFString)
+    guard err == .success else {
+        return .failed(message: "AXPress failed with AXError \(err.rawValue)", observed: activeTabName(card))
+    }
+
+    let deadline = Date().addingTimeInterval(waitSeconds)
+    var lastObserved: String?
+    while Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.25)
+        guard let card = findCardContainer(pid: pid) else { continue }
+        let heading = activeTabName(card)
+        lastObserved = heading
+        let selected = tabButtons(card).first { $0.name.lowercased() == target.lowercased() }?.selected ?? false
+        guard selected else { continue }
+        if let heading, heading.lowercased() == target.lowercased() {
+            return .ok(observed: heading)
+        }
+        if heading == nil {
+            // The Me tab may not render a PrimaryLabel heading; the button state is
+            // then the only signal we have, and it's a reliable one.
+            return .ok(observed: nil)
+        }
+    }
+    return .failed(message: "tab did not become active within \(Int(waitSeconds))s", observed: lastObserved)
+}
+
+/// Waits until the row count stops changing, so we don't read a half-populated list.
+func settle(pid: pid_t, maxMilliseconds: Int) {
+    let deadline = Date().addingTimeInterval(Double(maxMilliseconds) / 1000.0)
+    var previous = rowCount(pid: pid)
+    while Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.3)
+        let current = rowCount(pid: pid)
+        if current == previous && current >= 0 { return }
+        previous = current
+    }
+}
+
+// MARK: - App lifecycle
+
+func findMyProcess() -> NSRunningApplication? {
+    NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == findMyBundleID }
+}
+
+/// Asks the system to open Find My. Used both to launch it and to bring back its
+/// window: Find My frequently sits running with zero AX windows (the state
+/// imac/fix_findmy_window.sh existed to repair), and re-opening recreates the scene.
+///
+/// Launches by bundle identifier — the app's CFBundleName became "FindMy" (no space)
+/// in Find My 5.0, so launching by name, as this tool used to, no longer works.
+@discardableResult
+func openFindMy(activates: Bool, timeout: Double = 20, attempts: Int = 3) -> NSRunningApplication? {
+    guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: findMyBundleID) else {
+        return nil
+    }
+    let config = NSWorkspace.OpenConfiguration()
+    config.activates = activates
+    config.addsToRecentItems = false
+
+    // Opening an app that is still shutting down fails outright, and the caller's
+    // usual recovery is exactly that — pkill Find My, then ask us to start it again.
+    // So retry rather than reporting "not running" on the first refusal.
+    for attempt in 0..<attempts {
+        var launched: NSRunningApplication?
+        var openError: Error?
+        let semaphore = DispatchSemaphore(value: 0)
+        NSWorkspace.shared.openApplication(at: url, configuration: config) { app, error in
+            // Take the app from the callback rather than polling
+            // NSWorkspace.runningApplications: that list is refreshed by workspace
+            // notifications delivered on the main run loop, which a command-line
+            // tool never runs, so a freshly launched app would stay invisible to it.
+            launched = app
+            openError = error
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + timeout) == .success else {
+            warn("openApplication attempt \(attempt + 1)/\(attempts) timed out")
+            continue
+        }
+
+        if let launched {
+            // Give the Catalyst scene a moment to build its AX tree.
+            Thread.sleep(forTimeInterval: 2.0)
+            return launched
+        }
+        warn("openApplication attempt \(attempt + 1)/\(attempts) failed: "
+             + (openError?.localizedDescription ?? "no application returned"))
+        if attempt < attempts - 1 { Thread.sleep(forTimeInterval: 2.0) }
+    }
+    return nil
+}
+
+// MARK: - Output
+
+func iso8601Now() -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.timeZone = TimeZone(identifier: "UTC")
+    return formatter.string(from: Date())
+}
+
+func makeEncoder(pretty: Bool, snakeCase: Bool) -> JSONEncoder {
+    let encoder = JSONEncoder()
+    var formatting: JSONEncoder.OutputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    if pretty { formatting.insert(.prettyPrinted) }
+    encoder.outputFormatting = formatting
+    if snakeCase { encoder.keyEncodingStrategy = .convertToSnakeCase }
+    return encoder
+}
+
+func emit<T: Encodable>(_ payload: T, pretty: Bool, snakeCase: Bool) -> Bool {
+    do {
+        let data = try makeEncoder(pretty: pretty, snakeCase: snakeCase).encode(payload)
+        // Swift omits keys whose value is nil rather than emitting null, so callers
+        // must use .get()-style access for every optional field.
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+        return true
+    } catch {
+        warn("JSON encoding failed: \(error)")
+        return false
+    }
+}
+
+/// Failure still prints a JSON object, so a caller that only captured stdout can
+/// report *why*. The exit code is the signal; this is the detail. Never prints "[]".
+func fail(_ code: ExitCode, _ message: String, tabRequested: String? = nil,
+          tabObserved: String? = nil, pid: pid_t? = nil, pretty: Bool) -> Never {
+    warn("error [\(code.kind)]: \(message)")
+    let envelope = Envelope(
+        ok: false,
+        schemaVersion: schemaVersion,
+        tab: nil,
+        tabRequested: tabRequested,
+        tabVerified: false,
+        extractedAt: iso8601Now(),
+        appPid: pid,
+        count: 0,
+        warnings: [],
+        devices: [],
+        error: ExtractionError(code: code.rawValue, kind: code.kind, message: message,
+                               tabRequested: tabRequested, tabObserved: tabObserved)
+    )
+    _ = emit(envelope, pretty: pretty, snakeCase: true)
+    exit(code.rawValue)
+}
+
+// MARK: - CLI
+
+let usageText = """
+Usage: airtag_extractor [options]
+
+  --tab NAME            people | devices | items | me
+                        Switches to the tab and verifies the switch landed.
+                        Omit to read whichever tab is currently active.
+                        Switching brings Find My to the front — the press is
+                        silently ignored otherwise.
+  --wait-for-tab SECS   How long to wait for the tab switch (default 20)
+  --settle-ms MS        Wait for the row count to stabilise, up to MS (default 800)
+  --launch              Launch Find My if it isn't running, and reopen its window
+                        if it is running without one
+  --no-activate         Never bring Find My to the front. Reading the current tab
+                        still works; switching tabs will not.
+  --include-raw         Include each row's raw text array
+  --format FORMAT       json (default) | legacy
+  --pretty              Pretty-print the JSON
+  --version, --help
+
+Exit codes:
+  0 ok            2 ax_not_trusted   3 app_not_running   4 no_window
+  5 tab_switch_failed                6 no_rows           7 ax_error   64 usage
+"""
+
+struct Options {
+    var tab: String?
+    var waitForTab: Double = 20
+    var settleMs: Int = 800
+    var launch = false
+    var includeRaw = false
+    var legacyFormat = false
+    var pretty = false
+    var noActivate = false
+}
+
+func parseArguments() -> Options {
+    var options = Options()
+    var args = Array(CommandLine.arguments.dropFirst())
+
+    func next(_ flag: String) -> String {
+        guard !args.isEmpty else {
+            warn("\(flag) requires a value\n\n\(usageText)")
+            exit(ExitCode.usage.rawValue)
+        }
+        return args.removeFirst()
+    }
+
+    let validTabs = ["people": "People", "devices": "Devices", "items": "Items", "me": "Me"]
+
+    while !args.isEmpty {
+        let arg = args.removeFirst()
+        switch arg {
+        case "--tab":
+            let raw = next("--tab").lowercased()
+            guard let canonical = validTabs[raw] else {
+                warn("unknown tab '\(raw)'; expected one of: people, devices, items, me")
+                exit(ExitCode.usage.rawValue)
+            }
+            options.tab = canonical
+        case "--wait-for-tab":
+            options.waitForTab = Double(next("--wait-for-tab")) ?? 20
+        case "--settle-ms":
+            options.settleMs = min(max(Int(next("--settle-ms")) ?? 800, 0), 5000)
+        case "--launch":
+            options.launch = true
+        case "--no-activate":
+            options.noActivate = true
+        case "--include-raw":
+            options.includeRaw = true
+        case "--format":
+            let value = next("--format").lowercased()
+            guard value == "json" || value == "legacy" else {
+                warn("unknown format '\(value)'; expected json or legacy")
+                exit(ExitCode.usage.rawValue)
+            }
+            options.legacyFormat = value == "legacy"
+        case "--pretty":
+            options.pretty = true
+        case "--version":
+            print("airtag_extractor schema \(schemaVersion)")
+            exit(0)
+        case "-h", "--help":
+            print(usageText)
+            exit(0)
+        default:
+            warn("unknown argument '\(arg)'\n\n\(usageText)")
+            exit(ExitCode.usage.rawValue)
+        }
+    }
+    return options
+}
+
+// MARK: - Main
+
+func run() -> Never {
+    let options = parseArguments()
+
+    // Checked before touching any AX API: without this the old binary silently
+    // reported "no devices" when the real problem was a revoked TCC grant.
+    guard AXIsProcessTrusted() else {
+        fail(.axNotTrusted,
+             "Accessibility permission is not granted. Add this binary's parent process "
+             + "(Terminal, iTerm, or the LaunchAgent's program) under System Settings > "
+             + "Privacy & Security > Accessibility.",
+             pretty: options.pretty)
+    }
+
+    var app = findMyProcess()
+    if app == nil {
+        guard options.launch else {
+            fail(.appNotRunning, "Find My is not running (pass --launch to start it)", pretty: options.pretty)
+        }
+        // Activation is not cosmetic here: Find My only builds its window scene when
+        // it is brought to the front. Launched in the background it sits there with
+        // zero accessible windows and nothing to read.
+        app = openFindMy(activates: !options.noActivate)
+        guard app != nil else {
+            fail(.appNotRunning, "failed to launch Find My (\(findMyBundleID))", pretty: options.pretty)
+        }
+    }
+    var pid = app!.processIdentifier
+
+    // Confirm there is a window to work with BEFORE trying to switch tabs. Find My
+    // is often running with zero AX windows, and a tab switch attempted in that
+    // state fails in a way that looks like a tab problem — which sends the caller
+    // down a retry path instead of the window-recovery path it actually needs.
+    if findCardContainerWithRetry(pid: pid) == nil, options.launch {
+        warn("Find My has no accessible window; re-opening to recreate it")
+        if let reopened = openFindMy(activates: !options.noActivate) {
+            app = reopened
+            pid = reopened.processIdentifier
+        }
+    }
+    guard findCardContainerWithRetry(pid: pid) != nil else {
+        fail(.noWindow,
+             "Find My is running but has no accessible window containing CardContainerView "
+             + "(the window is closed or minimised)"
+             + (options.launch ? "" : "; pass --launch to let this tool reopen it"),
+             tabRequested: options.tab, pid: pid, pretty: options.pretty)
+    }
+
+    var tabVerified = false
+    var observedTab: String?
+
+    if let target = options.tab {
+        switch switchToTab(app: app!, target: target, waitSeconds: options.waitForTab,
+                           activate: !options.noActivate) {
+        case .ok(let observed):
+            tabVerified = true
+            observedTab = observed ?? target
+        case .failed(let message, let observed):
+            // A window that vanished mid-switch is a window problem, not a tab one.
+            let code: ExitCode = findCardContainer(pid: pid) == nil ? .noWindow : .tabSwitchFailed
+            fail(code, message, tabRequested: target, tabObserved: observed,
+                 pid: pid, pretty: options.pretty)
+        }
+        settle(pid: pid, maxMilliseconds: options.settleMs)
+    }
+
+    guard let card = findCardContainerWithRetry(pid: pid) else {
+        fail(.noWindow,
+             "Find My's window disappeared between the tab switch and the read",
+             tabRequested: options.tab, pid: pid, pretty: options.pretty)
+    }
+
+    if observedTab == nil { observedTab = activeTabName(card) }
+
+    var rowGroups: [[AXUIElement]] = []
+    scanRows(card, into: &rowGroups)
+
+    // The tree was rebuilt mid-scan; one retry, then give up rather than report
+    // a partial list as if it were complete.
+    if sawStaleElement {
+        sawStaleElement = false
+        rowGroups = []
+        guard let fresh = findCardContainerWithRetry(pid: pid) else {
+            fail(.axError, "accessibility tree changed during scan and could not be re-read",
+                 tabRequested: options.tab, pid: pid, pretty: options.pretty)
+        }
+        scanRows(fresh, into: &rowGroups)
+        if sawStaleElement {
+            fail(.axError, "accessibility tree kept changing during scan",
+                 tabRequested: options.tab, pid: pid, pretty: options.pretty)
+        }
+    }
+
+    var devices: [DeviceRow] = []
+    var warnings: [String] = []
+    for (index, children) in rowGroups.enumerated() {
+        guard let parsed = parseRow(children: children, index: index, includeRaw: options.includeRaw) else {
+            warnings.append("row_\(index)_unparsed")
+            continue
+        }
+        devices.append(parsed.row)
+        warnings.append(contentsOf: parsed.warnings)
+    }
+
+    let extractedAt = iso8601Now()
+
+    if options.legacyFormat {
+        let legacy = devices.map {
+            LegacyDevice(name: $0.name,
+                         location: $0.location ?? "-",
+                         timeStatus: $0.timeStatus ?? "-",
+                         distance: $0.distance?.text ?? "-",
+                         batteryStatus: $0.battery,
+                         extractedAt: extractedAt)
+        }
+        guard emit(legacy, pretty: options.pretty, snakeCase: false) else {
+            exit(ExitCode.axError.rawValue)
+        }
+    } else {
+        let envelope = Envelope(
+            ok: true,
+            schemaVersion: schemaVersion,
+            tab: observedTab,
+            tabRequested: options.tab,
+            tabVerified: tabVerified,
+            extractedAt: extractedAt,
+            appPid: pid,
+            count: devices.count,
+            warnings: warnings,
+            devices: devices,
+            error: nil
+        )
+        guard emit(envelope, pretty: options.pretty, snakeCase: true) else {
+            exit(ExitCode.axError.rawValue)
+        }
+    }
+
+    warn("extracted \(devices.count) row(s) from tab '\(observedTab ?? "unknown")'")
+
+    // An empty list on a verified tab is legitimate (the Me tab has no rows), but
+    // it is still worth distinguishing from a successful read with content.
+    exit(devices.isEmpty ? ExitCode.noRows.rawValue : ExitCode.ok.rawValue)
+}
+
+run()

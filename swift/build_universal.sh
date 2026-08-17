@@ -24,7 +24,7 @@ rm -f airtag_extractor_arm64
 
 # Build for x86_64 (Intel)
 echo "🔨 Building for Intel (x86_64)..."
-swiftc airtag_extractor.swift -o airtag_extractor_x86_64 -target x86_64-apple-macos10.15
+swiftc airtag_extractor.swift -o airtag_extractor_x86_64 -target x86_64-apple-macos11.0
 
 if [ $? -ne 0 ]; then
     echo "❌ Failed to build for Intel architecture"
