@@ -3,11 +3,16 @@
 Find My app lifecycle helpers.
 
 This module used to drive tab switching too, via AppleScript menu clicks
-(View → People/Devices/Items). As of the macOS 26+ rewrite the Swift extractor
-switches tabs itself by sending AXPress to the tab button and confirming the
-switch landed, so nothing here is on the tab-switching path any more — see
-swift/airtag_extractor.swift. What remains in use is process lifecycle:
-ensure_find_my_running(), restart_find_my(), and the stuck-window recovery.
+(View → People/Devices/Items). The Swift extractor now does that itself — through
+the same View menu, but over the Accessibility API rather than Apple Events, and
+verifying the switch against the list heading — so nothing here is on the
+tab-switching path any more. See swift/airtag_extractor.swift. What remains in use
+is process lifecycle: ensure_find_my_running() and restart_find_my().
+
+Everything here that still shells out to osascript is recovery-path only, and slow
+under launchd: a LaunchAgent has no Automation grant, so Apple Events to System
+Events hang until their timeout instead of failing. Keep that off the critical
+path — is_find_my_running() uses pgrep for exactly this reason.
 
 The AppleScript tab helpers below (switch_to_tab, get_active_tab,
 verify_tab_switch, activate_find_my) are retained for one release as a fallback
@@ -215,7 +220,12 @@ class FindMyAutomation:
         """
         Force Find My to refresh by simulating Cmd+R.
 
-        This can help when Find My stops syncing with iCloud.
+        UNUSED, and must stay that way — same trap as simulate_mouse_jiggle. The
+        keystroke is real user input to macOS, so calling this makes the tracker's idle
+        gate conclude someone is at the keyboard and stand down for
+        RESUME_AFTER_IDLE_SECONDS. It also needs an Automation grant a LaunchAgent does
+        not have, so under launchd it hangs until its timeout about half the time.
+        Find My re-syncs on its own; rows routinely read "Now" without any of this.
 
         Returns:
             True if successful, False otherwise
@@ -289,7 +299,10 @@ class FindMyAutomation:
         """
         Move mouse slightly to simulate user activity.
 
-        This prevents macOS from thinking the system is idle.
+        UNUSED, and must stay that way. The tracker now pauses itself whenever the Mac
+        shows user input, so faking input here would make it stand down for
+        RESUME_AFTER_IDLE_SECONDS every time this ran. Kept only because the docstring
+        explains a hack someone may otherwise reinvent.
 
         Returns:
             True if successful, False otherwise
@@ -549,57 +562,54 @@ class FindMyAutomation:
         """
         Check if Find My app is currently running.
 
+        Uses pgrep, not System Events. Asking System Events costs an Apple Event, which
+        needs an Automation TCC grant that a LaunchAgent does not have and cannot be
+        prompted for — there the call does not fail cleanly, it hangs until the timeout,
+        on every single check. Under launchd that turned every cycle into a minute of
+        "Failed to check if FindMy is running" and nothing else.
+
         Returns:
             True if running, False otherwise
         """
-        applescript = f'''
-        tell application "System Events"
-            return (name of processes) contains "{self.app_name}"
-        end tell
-        '''
-
         try:
             result = subprocess.run(
-                ['osascript', '-e', applescript],
-                check=True,
+                ['pgrep', '-x', self.app_name],
                 capture_output=True,
                 text=True,
                 timeout=5
             )
-            return result.stdout.strip() == 'true'
+            return result.returncode == 0
         except Exception as e:
             logger.error(f"Failed to check if {self.app_name} is running: {e}")
             return False
 
     def ensure_find_my_running(self) -> bool:
         """
-        Ensure Find My is running with a visible window.
+        Ensure the Find My process exists.
+
+        Only the process, deliberately. Whether the window is usable is the Swift
+        extractor's business: it verifies the window itself, recreates a missing one
+        with --launch, and reports exit 4 when it cannot, which the tracker answers
+        with _try_fix_findmy_window(). Checking here as well meant a second opinion
+        formed through AppleScript, which is exactly the dependency that breaks under
+        launchd — see is_find_my_running.
 
         Returns:
-            True if Find My is running with window, False otherwise
+            True if Find My is running, False otherwise
         """
         if self.is_find_my_running():
             logger.debug(f"{self.app_name} is already running")
-            # Also check for window - app can run without one
-            if not self.ensure_window_exists():
-                logger.error(f"{self.app_name} running but could not create window")
-                return False
             return True
 
+        # `open -b` needs no Automation grant, unlike `tell application "FindMy"`.
         logger.info(f"Launching {self.app_name}...")
-        applescript = f'''
-        tell application "{self.app_name}"
-            activate
-        end tell
-        '''
-
         try:
             subprocess.run(
-                ['osascript', '-e', applescript],
+                ['open', '-b', 'com.apple.findmy'],
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=30
             )
 
             # Wait for app to launch

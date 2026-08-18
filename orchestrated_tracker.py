@@ -2,14 +2,16 @@
 """
 Orchestrated AirTag Tracker with Tab Cycling
 
-Cycles through every Find My tab (People, Devices, Items, Me) to track all
-entities in the Find My ecosystem.
+Cycles through the reachable Find My tabs (People, Devices, Items) to track all
+entities in the Find My ecosystem. Me is not reachable on Find My 5.0 — see
+run_single_cycle.
 
 Per cycle, for each tab:
 1. Ask swift/airtag_extractor to switch to the tab and read it
-2. The extractor presses the tab button, waits until both the tab button's
-   selected state and the list heading confirm the switch, waits for the row
-   count to settle, then returns the rows plus the tab name it actually read
+2. The extractor drives Find My's View menu, waits until the list heading confirms
+   the switch, waits for the row count to settle, then returns the rows plus the
+   tab name it actually read. The tab button's own selected state is NOT trusted:
+   pressing it changes that state without navigating.
 3. Records are labelled with that verified tab name — never with the tab we asked
    for, so a slow-loading tab can't file its predecessor's rows under the wrong type
 
@@ -47,6 +49,7 @@ EXIT_NO_WINDOW = 4
 EXIT_TAB_SWITCH_FAILED = 5
 EXIT_NO_ROWS = 6
 EXIT_AX_ERROR = 7
+EXIT_USER_ACTIVE = 8
 EXIT_USAGE = 64
 
 # device_type in the database <-> --tab argument <-> the name Find My displays
@@ -65,11 +68,18 @@ class ExtractionResult:
       'empty'  the tab was read and verified but holds no rows (normal for Me)
       'fatal'  something no amount of retrying or restarting will fix
       'failed' transient; counts toward the Find My restart logic
+      'paused' the Mac is in use, so nothing was attempted. Not a failure: retrying
+               or restarting Find My would only steal focus from whoever is typing.
+
+    exit_code carries the extractor's last exit code for 'failed', because the right
+    response differs sharply: a tab-switch failure is worth retrying, while "no window"
+    usually means there is no display to draw one on, which no retry can fix.
     """
     outcome: str
     devices: List[Dict] = field(default_factory=list)
     verified_tab: Optional[str] = None
     detail: Optional[str] = None
+    exit_code: Optional[int] = None
 
 
 # Configure logging - file only to avoid duplicates
@@ -154,9 +164,24 @@ class OrchestratedAirTagTracker:
     MAX_CONSECUTIVE_FAILURES = 5
     FINDMY_RESTART_COOLDOWN = 300  # 5 minutes between restarts
 
+    # Restarting Find My cannot conjure a display, and without one it can never build a
+    # window — so a "no window" run is not the kind of illness the restart machinery
+    # cures. On 2026-08-18 that mistake cost 8 hours: DeskPad (the virtual display) was
+    # not running, every cycle exited 4, and the tracker killed and relaunched Find My
+    # 33 times to no effect. After this many no-window cycles in a row, say what is
+    # actually wrong and stop restarting.
+    NO_WINDOW_STREAK_BEFORE_BACKOFF = 3
+
     # Keep-alive settings
     KEEPALIVE_INTERVAL = 1800  # 30 minutes - force refresh Find My
     PREEMPTIVE_RESTART_INTERVAL = 14400  # 4 hours - restart Find My to prevent stale state
+
+    # Reading Find My means bringing it to the front, which is intolerable while
+    # someone is using the Mac. Nothing that steals focus runs until the Mac has been
+    # idle this long; any input at all puts the tracker back to sleep immediately.
+    # 0 disables the courtesy entirely. Override in config.json:
+    #   "automation": { "resume_after_idle_seconds": 300 }
+    RESUME_AFTER_IDLE_SECONDS = 300
 
     def __init__(self, dry_run: bool = False):
         """Initialize the orchestrated tracker."""
@@ -173,10 +198,19 @@ class OrchestratedAirTagTracker:
         # Failure tracking for auto-recovery
         self.consecutive_failures = 0
         self.last_findmy_restart: Optional[datetime] = None
+        # Consecutive tabs that came back "no window"; see NO_WINDOW_STREAK_BEFORE_BACKOFF
+        self.no_window_streak = 0
+        self.display_helper = REPO_DIR / "swift" / "set_display_mode"
 
         # Keep-alive tracking
         self.last_keepalive: Optional[datetime] = None
         self.last_preemptive_restart: Optional[datetime] = None
+
+        # Set when a cycle stood down because someone is using the Mac. Like
+        # fatal_error it ends the cycle, but it is not a failure and must never
+        # count toward the Find My restart logic.
+        self.paused_for_user: Optional[str] = None
+        self.idle_threshold = self._load_idle_threshold()
 
         # Verify Swift extractor exists
         if not self.swift_extractor.exists() or not os.access(self.swift_extractor, os.X_OK):
@@ -190,6 +224,93 @@ class OrchestratedAirTagTracker:
         # Initialize database schema via shared module
         init_schema()
         logger.info("Initialized orchestrated tracker%s", " (dry run)" if dry_run else "")
+
+    def _load_idle_threshold(self) -> float:
+        """
+        Seconds of idle required before the tracker will steal focus.
+
+        config.json wins over the class default. Read through an absolute path: the
+        old relative open() quietly fell back to the default whenever the process was
+        started from another directory.
+        """
+        threshold = float(self.RESUME_AFTER_IDLE_SECONDS)
+        try:
+            with open(REPO_DIR / 'config.json') as f:
+                configured = json.load(f).get('automation', {}).get('resume_after_idle_seconds')
+            if configured is not None:
+                threshold = max(float(configured), 0.0)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            logger.debug(f"Using default idle threshold ({threshold}s): {e}")
+
+        try:
+            with open(REPO_DIR / 'config.json') as f:
+                self.read_details = bool(json.load(f).get('automation', {}).get('read_details', True))
+        except (OSError, ValueError, json.JSONDecodeError):
+            self.read_details = True
+
+        if threshold > 0:
+            logger.info(f"Will pause while the Mac is in use, resuming after {threshold:.0f}s idle")
+        else:
+            logger.info("User-activity pausing is disabled; Find My will be pulled to the front "
+                        "even while the Mac is in use")
+        return threshold
+
+    def _request_accessibility_once(self) -> None:
+        """
+        Ask macOS for Accessibility permission, once per process.
+
+        A LaunchAgent is refused in silence: nothing prompts, and nothing appears in
+        System Settings to switch on, so the tracker looks broken with no way forward.
+        Asking from inside this process tree registers it in the Accessibility list —
+        after which granting it is one toggle rather than hunting for a binary path.
+        """
+        if getattr(self, '_asked_for_accessibility', False):
+            return
+        self._asked_for_accessibility = True
+        try:
+            subprocess.run([str(self.swift_extractor), '--request-permission'],
+                           capture_output=True, text=True, timeout=30)
+        except subprocess.SubprocessError as e:
+            logger.debug(f"Could not request Accessibility permission: {e}")
+        logger.error(
+            "Grant Accessibility to this tracker: System Settings > Privacy & Security > "
+            "Accessibility. It should now be listed (as Python); switch it on. If it is "
+            "not listed, add %s with the + button.", self.swift_extractor.parent.parent / 'venv/bin/python'
+        )
+
+    def user_idle_seconds(self) -> Optional[float]:
+        """
+        Seconds since the last user input, or None if it could not be determined.
+
+        Delegates to the extractor so Python and Swift agree on what counts as
+        activity — notably that input arriving over Screen Sharing counts.
+        """
+        try:
+            result = subprocess.run(
+                [str(self.swift_extractor), '--print-idle'],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return float(result.stdout.strip())
+        except (subprocess.SubprocessError, ValueError) as e:
+            logger.debug(f"Could not read idle time: {e}")
+        return None
+
+    def _user_is_active(self) -> Optional[float]:
+        """
+        Idle seconds if the Mac is in use and automation should stand down, else None.
+
+        Deliberately fails open: if the idle time cannot be read we go ahead, because
+        the extractor re-checks with --require-idle before it touches anything. This
+        check exists only to skip the disruptive work that happens *before* the
+        extractor runs, such as launching Find My.
+        """
+        if self.idle_threshold <= 0:
+            return None
+        idle = self.user_idle_seconds()
+        if idle is not None and idle < self.idle_threshold:
+            return idle
+        return None
 
     def extract_locations_for_tab(self, device_type: DeviceType,
                                   retry_count: int = 3) -> 'ExtractionResult':
@@ -219,7 +340,17 @@ class OrchestratedAirTagTracker:
             '--settle-ms', str(self.EXTRACTOR_SETTLE_MS),
             '--launch',
         ]
+        # The extractor is the authoritative gate: it re-checks idle time immediately
+        # before it activates Find My, catching input that arrives after we looked.
+        if self.idle_threshold > 0:
+            cmd += ['--require-idle', str(self.idle_threshold)]
+        # Street addresses: the plain list only says "Ghent"; selecting each row (which
+        # --details does) exposes "Kortrijksesteenweg, Ghent". Costs ~0.3s per row.
+        # Disable with automation.read_details=false in config.json.
+        if self.read_details:
+            cmd += ['--details']
 
+        last_code: Optional[int] = None
         for attempt in range(retry_count):
             try:
                 result = subprocess.run(
@@ -238,6 +369,7 @@ class OrchestratedAirTagTracker:
                 continue
 
             code = result.returncode
+            last_code = code
             payload = {}
             if result.stdout.strip():
                 try:
@@ -248,6 +380,12 @@ class OrchestratedAirTagTracker:
             detail = (payload.get('error') or {}).get('message') or result.stderr.strip()
 
             if code == EXIT_OK:
+                # The extractor reports non-fatal trouble (a row that would not enrich,
+                # a detail view it had to dismiss) on stderr while still exiting 0.
+                # Silently dropping that made the details sweep undebuggable.
+                for line in result.stderr.strip().splitlines():
+                    if line and not line.startswith('extracted '):
+                        logger.warning(f"extractor: {line}")
                 devices = payload.get('devices', [])
                 verified = payload.get('tab')
                 # extracted_at is on the envelope, one per run; copy it onto each
@@ -265,10 +403,17 @@ class OrchestratedAirTagTracker:
                 logger.info(f"Tab '{verified or tab_arg}' is empty (no rows)")
                 return ExtractionResult('empty', [], verified)
 
+            if code == EXIT_USER_ACTIVE:
+                # Someone is using the Mac. The extractor stood down without touching
+                # Find My; retrying now would only fight them for focus.
+                logger.info(f"Standing down for {device_type} tab: {detail}")
+                return ExtractionResult('paused', [], None, detail)
+
             if code == EXIT_AX_NOT_TRUSTED:
                 # Retrying cannot fix a missing TCC grant, and restarting Find My
                 # certainly cannot. Surface it and stop the cycle.
                 logger.error(f"Accessibility permission missing: {detail}")
+                self._request_accessibility_once()
                 return ExtractionResult('fatal', [], None, detail)
 
             if code == EXIT_USAGE:
@@ -292,7 +437,29 @@ class OrchestratedAirTagTracker:
                 time.sleep(2)
 
         logger.error(f"Failed to extract {device_type} tab after {retry_count} attempts")
-        return ExtractionResult('failed', [], None)
+        return ExtractionResult('failed', [], None, exit_code=last_code)
+
+    def _geocode(self, geocode_text: str) -> tuple:
+        """
+        Coordinates for one already alias-resolved location, or (None, None).
+
+        Must be called outside any write transaction on the database — see
+        save_locations for what happens otherwise.
+        """
+        try:
+            geo_result = self.geocoder.geocode_full(geocode_text)
+            if geo_result:
+                logger.debug(f"Geocoded {geocode_text} -> "
+                             f"({geo_result['latitude']:.6f}, {geo_result['longitude']:.6f})")
+                return geo_result['latitude'], geo_result['longitude']
+            # Fallback to simple geocode (cache-only hits without structured data)
+            latitude, longitude = self.geocoder.geocode(geocode_text)
+            if latitude and longitude:
+                logger.debug(f"Geocoded (fallback) {geocode_text} -> ({latitude:.6f}, {longitude:.6f})")
+            return latitude, longitude
+        except Exception as e:
+            logger.warning(f"Geocoding failed for '{geocode_text}': {e}")
+            return None, None
 
     def save_locations(self, devices: List[Dict], device_type: DeviceType) -> tuple:
         """
@@ -310,6 +477,27 @@ class OrchestratedAirTagTracker:
 
         saved_count = 0
         saved_device_names = set()
+
+        # Geocode BEFORE opening the write transaction below, never inside it.
+        #
+        # The geocoder caches into this same SQLite file on its own connection. Doing
+        # that while this function holds a write transaction deadlocks us against
+        # ourselves: the cache INSERT waits for a lock we are holding, gives up after
+        # busy_timeout, and logs "Failed to save to cache: database is locked". WAL and
+        # busy_timeout cannot help — the holder is waiting for the waiter. The effect was
+        # that geocoding results were never cached at all (31 failures on 2026-08-18
+        # alone), so every cycle re-queried Nominatim for the same place names at 1.1s
+        # each, for nothing.
+        geocoded: Dict[str, tuple] = {}
+        for device_data in devices:
+            pre = sanitize_device_data(dict(device_data))
+            if pre is None:
+                continue
+            # The street address (from --details) beats the coarse list label: geocoding
+            # "Kortrijksesteenweg, Ghent" lands on the street, "Ghent" on the city centre.
+            text = resolve_location_alias(pre.get('address') or pre['location'])
+            if text not in geocoded:
+                geocoded[text] = self._geocode(text)
 
         with get_connection() as conn:
             try:
@@ -335,7 +523,9 @@ class OrchestratedAirTagTracker:
                             extracted_at = extracted_at.replace('T', ' ').replace('Z', '')
 
                     device_name = resolve_device_alias(cleaned['name'])
-                    location_text = cleaned['location']
+                    # Store the street when we have one — the location column has always
+                    # held whatever Find My showed, and the selected row simply shows more.
+                    location_text = cleaned.get('address') or cleaned['location']
 
                     # Skip duplicates within 2-minute window
                     if is_duplicate(conn, device_name, location_text):
@@ -347,24 +537,10 @@ class OrchestratedAirTagTracker:
                         ''', (device_name,))
                         continue
 
-                    # Resolve alias (e.g. "Home" → "Onderstraat 7, 9000 Ghent")
+                    # Resolve alias (e.g. "Home" → "Onderstraat 7, 9000 Ghent") and take
+                    # the coordinates from the pre-pass above.
                     geocode_text = resolve_location_alias(location_text)
-
-                    # Geocode the resolved address (full structured data)
-                    latitude, longitude = None, None
-                    try:
-                        geo_result = self.geocoder.geocode_full(geocode_text)
-                        if geo_result:
-                            latitude = geo_result['latitude']
-                            longitude = geo_result['longitude']
-                            logger.debug(f"Geocoded {location_text} -> ({latitude:.6f}, {longitude:.6f})")
-                        else:
-                            # Fallback to simple geocode (cache-only hits without structured data)
-                            latitude, longitude = self.geocoder.geocode(geocode_text)
-                            if latitude and longitude:
-                                logger.debug(f"Geocoded (fallback) {location_text} -> ({latitude:.6f}, {longitude:.6f})")
-                    except Exception as e:
-                        logger.warning(f"Geocoding failed for '{geocode_text}': {e}")
+                    latitude, longitude = geocoded.get(geocode_text, (None, None))
 
                     # Computed timestamp from relative time (e.g. "15 min ago" → absolute)
                     location_timestamp = cleaned.get('location_timestamp')
@@ -450,13 +626,108 @@ class OrchestratedAirTagTracker:
 
         return saved_count, saved_device_names
 
-    def _handle_extraction_failure(self, device_type: str) -> None:
+    def _have_display(self) -> bool:
+        """
+        Is there a display for Find My to build its window on?
+
+        Fails open (returns True) when it cannot tell, so a broken probe never stops the
+        tracker from trying — the extractor's exit 4 remains the real signal.
+        """
+        if not self.display_helper.exists():
+            return True
+        try:
+            probe = subprocess.run([str(self.display_helper), '--list'],
+                                   capture_output=True, text=True, timeout=15)
+            return probe.returncode != 1   # 1 == no external display online
+        except subprocess.SubprocessError as e:
+            logger.debug(f"Display probe failed, assuming a display exists: {e}")
+            return True
+
+    def _recover_no_window(self) -> None:
+        """
+        The one sequence that actually clears a wedged Find My window.
+
+        With the lid shut, the built-in display stays *online but asleep* — and it stays
+        the MAIN display, which is where new windows get created. Find My then builds its
+        scene on a sleeping screen and its accessibility tree comes up self-referential:
+        kAXWindows hands back the AXApplication element, recursively, so there is no
+        CardContainerView and every read exits 4.
+
+        Relaunching Find My on its own does NOT clear that — measured on 2026-08-18.
+        Declaring user activity does: the sleeping built-in drops offline, the virtual
+        display becomes main, and a relaunch then builds a real SceneWindow.
+
+        caffeinate declares activity through a power assertion rather than by posting
+        events, so this does not trip the idle gate (verified: the idle counter kept
+        climbing straight through it). Never substitute anything that fakes input.
+        """
+        logger.warning("[RECOVERY] Find My has no usable window; nudging the display "
+                       "awake, then relaunching Find My")
+        try:
+            subprocess.run(['caffeinate', '-u', '-t', '2'], capture_output=True, timeout=15)
+        except subprocess.SubprocessError as e:
+            logger.debug(f"caffeinate nudge failed: {e}")
+        time.sleep(3)
+        self._restart_find_my()
+
+    def _diagnose_no_window(self) -> None:
+        """
+        Explain a persistent "Find My has no accessible window", instead of thrashing.
+
+        Find My is a Catalyst app: it only builds a window scene when the GUI session has
+        a display to render on. This Mac usually runs with its lid shut and no monitor, so
+        that display is DeskPad's virtual one. No DeskPad, no window, and no amount of
+        relaunching Find My changes that.
+        """
+        deskpad = subprocess.run(['pgrep', '-x', 'DeskPad'],
+                                 capture_output=True, text=True).returncode == 0
+        displays = "unknown"
+        if self.display_helper.exists():
+            probe = subprocess.run([str(self.display_helper), '--list'],
+                                   capture_output=True, text=True, timeout=15)
+            displays = "none online" if probe.returncode == 1 else (
+                probe.stdout.strip().splitlines() or ["?"])[0]
+
+        logger.error(
+            "[DIAGNOSIS] Find My has had no accessible window for %d tabs in a row. "
+            "Restarting it will not help — it cannot build a window without a display. "
+            "DeskPad running: %s. External display: %s. "
+            "Fix the display (start DeskPad, open the lid, or attach a monitor); "
+            "tracking resumes by itself once one exists.",
+            self.no_window_streak, "yes" if deskpad else "NO", displays
+        )
+        if not deskpad:
+            logger.error("[DIAGNOSIS] Start it with: open -b com.stengo.DeskPad "
+                         "(the com.airtrackr.display agent should be doing this at login "
+                         "and every 5 minutes — check logs/display.log)")
+
+    def _handle_extraction_failure(self, device_type: str, exit_code: Optional[int] = None) -> None:
         """
         Track consecutive failures and restart Find My if threshold exceeded.
 
         Args:
             device_type: Type of tab that failed extraction
+            exit_code: The extractor's exit code, so a missing window — which a restart
+                cannot fix — is handled by explaining it rather than by relaunching.
         """
+        if exit_code == EXIT_NO_WINDOW:
+            self.no_window_streak += 1
+            # Deliberately never touches consecutive_failures: keeping it below the
+            # threshold is what keeps the blind restart machinery out of this.
+            #
+            # Recovery is retried every 12 no-window tabs (= every ~4 cycles, 3 tabs per
+            # cycle), not attempted just once: the display can come back at any moment —
+            # DeskPad restarting, a lid opening — and the wedged window it left behind
+            # only clears through _recover_no_window. A one-shot attempt made too early
+            # would otherwise leave the tracker down until its process restarted.
+            if self.no_window_streak % 12 == self.NO_WINDOW_STREAK_BEFORE_BACKOFF:
+                self._recover_no_window()
+            elif self.no_window_streak > self.NO_WINDOW_STREAK_BEFORE_BACKOFF:
+                self._diagnose_no_window()
+            return
+        else:
+            self.no_window_streak = 0
+
         self.consecutive_failures += 1
         logger.warning(
             f"[FAILURE] Extraction failure {self.consecutive_failures}/{self.MAX_CONSECUTIVE_FAILURES} "
@@ -543,9 +814,17 @@ class OrchestratedAirTagTracker:
         """
         Periodically refresh Find My to prevent stale state.
 
-        Runs every KEEPALIVE_INTERVAL seconds.
+        Runs every KEEPALIVE_INTERVAL seconds, but never while the Mac is in use:
+        both actions below steal focus, and the restart takes over a minute.
         """
         now = datetime.now()
+
+        # Deliberately does not touch the timestamps, so the refresh happens on the
+        # first cycle after the Mac goes idle rather than being skipped entirely.
+        idle = self._user_is_active()
+        if idle is not None:
+            logger.debug(f"Skipping keepalive: Mac in use ({idle:.0f}s since last input)")
+            return
 
         # A just-started tracker has no stale Find My state to clear, so treat
         # startup as the last restart. Otherwise every run — including every
@@ -558,6 +837,17 @@ class OrchestratedAirTagTracker:
 
         # Check if it's time for a preemptive restart (more aggressive)
         if (now - self.last_preemptive_restart).total_seconds() >= self.PREEMPTIVE_RESTART_INTERVAL:
+            # Only if there is a display to rebuild the window on. This restart destroys
+            # a working window on purpose, betting that Find My builds a fresh one — a bet
+            # it loses badly when no display exists, and the window does not come back
+            # until someone intervenes. Skipping is free: the whole point is staleness
+            # prevention, and a few more hours of uptime beats an outage.
+            if not self._have_display():
+                logger.warning("[KEEPALIVE] Skipping preemptive Find My restart: no display "
+                               "available to rebuild its window on")
+                self.last_preemptive_restart = now
+                self.last_keepalive = now
+                return
             logger.info("[KEEPALIVE] Preemptive Find My restart (every 4h to prevent stale state)")
             print("           🔄 Preemptive Find My restart")
             self._restart_find_my()
@@ -565,12 +855,20 @@ class OrchestratedAirTagTracker:
             self.last_keepalive = now  # Also counts as keepalive
             return
 
-        # Check if it's time for a simple refresh
-        if (now - self.last_keepalive).total_seconds() >= self.KEEPALIVE_INTERVAL:
-            logger.info("[KEEPALIVE] Sending refresh to Find My")
-            self.automation.refresh_find_my()
-            self.automation.simulate_mouse_jiggle()
-            self.last_keepalive = now
+        # There used to be a 30-minute "refresh" here that sent Cmd+R to Find My via
+        # System Events. It is gone, because it fought the idle gate and lost:
+        # the synthetic keystroke IS user input as far as macOS is concerned, so every
+        # successful refresh was followed ~5s later by
+        #   "Standing down: Mac in use (5s since last input)"
+        # and cost 5 minutes of tracking. Measured on 2026-08-18: refreshes at 08:09,
+        # 09:01, 10:11, 10:46 and 11:17 each caused exactly that, while the one that
+        # failed (09:37, Apple Events timeout) caused no pause at all — the control case.
+        #
+        # It bought nothing either: Find My refreshes itself, rows routinely read "Now",
+        # and under launchd the Apple Event hung half the time anyway. The same trap
+        # applies to simulate_mouse_jiggle(). Do not reintroduce either: anything that
+        # fakes input will pause this tracker for RESUME_AFTER_IDLE_SECONDS.
+        self.last_keepalive = now
 
     def _check_temp_wake_expiry(self) -> bool:
         """
@@ -629,9 +927,19 @@ class OrchestratedAirTagTracker:
         logger.info(f"Processing {tab_name} tab...")
         logger.info(f"{'='*60}")
 
-        # Ensure Find My is running. Tab switching itself no longer needs the app
-        # to be frontmost — the extractor sends AXPress directly — so there is no
-        # activate_find_my() call here any more.
+        # Checked before ensure_find_my_running(), which can launch or reopen Find My
+        # and is every bit as disruptive as the tab switch itself.
+        idle = self._user_is_active()
+        if idle is not None:
+            self.paused_for_user = (
+                f"Mac in use ({idle:.0f}s since last input); "
+                f"resuming after {self.idle_threshold:.0f}s idle"
+            )
+            logger.info(f"Standing down before {tab_name} tab: {self.paused_for_user}")
+            return False
+
+        # Ensure Find My is running. The extractor brings it to the front itself when
+        # it needs to change tab, so there is no activate_find_my() call here.
         if not self.automation.ensure_find_my_running():
             logger.error(f"Failed to ensure Find My is running for {tab_name} tab")
             logger.info(f"[FIX] Attempting immediate recovery for {tab_name} tab...")
@@ -652,14 +960,21 @@ class OrchestratedAirTagTracker:
             self.fatal_error = result.detail
             return False
 
+        if result.outcome == 'paused':
+            # Not a failure: leave the failure counter alone so a long working session
+            # can never be mistaken for a broken Find My and trigger a restart.
+            self.paused_for_user = result.detail
+            return False
+
         if result.outcome == 'failed':
             logger.warning(f"Extraction failed for {tab_name} tab")
-            self._handle_extraction_failure(device_type)
+            self._handle_extraction_failure(device_type, result.exit_code)
             return False
 
         # The tab was read successfully, so Find My is healthy — even if the tab
         # happened to be empty.
         self._reset_failure_count()
+        self.no_window_streak = 0
 
         if result.outcome == 'empty':
             logger.info(f"No rows in {tab_name} tab")
@@ -728,8 +1043,16 @@ class OrchestratedAirTagTracker:
         time.sleep(self.INITIAL_PAUSE)
 
         self.fatal_error = None
+        self.paused_for_user = None
         success_count = 0
-        tabs = ['person', 'device', 'item', 'me']
+        # 'me' is deliberately absent. Find My 5.0 on macOS 27 only exposes tab
+        # navigation through its View menu, which has items for People, Devices and
+        # Items but none for Me — and pressing the Me tab bar button changes the
+        # button's state without navigating, so the tab cannot be reached at all.
+        # Requesting it would fail every cycle and drive the Find My restart logic.
+        # It carried no rows in the first place. `--tab me` still works manually, and
+        # will start succeeding on its own if Apple adds the menu item back.
+        tabs = ['person', 'device', 'item']
 
         for i, device_type in enumerate(tabs):
             # Process the tab
@@ -740,6 +1063,13 @@ class OrchestratedAirTagTracker:
                 logger.error(f"Ending cycle early: {self.fatal_error}")
                 break
 
+            # Abandon the rest of the cycle the moment the Mac is in use. Carrying on
+            # would pull focus away two more times, and the remaining tabs will be read
+            # on the next cycle after the Mac goes quiet.
+            if self.paused_for_user:
+                logger.info(f"Ending cycle early: {self.paused_for_user}")
+                break
+
             # Pause after extraction (except for the last tab, which uses cycle end pause)
             if i < len(tabs) - 1:
                 logger.info(f"Pausing {self.EXTRACT_PAUSE}s before next tab...\n")
@@ -747,11 +1077,18 @@ class OrchestratedAirTagTracker:
 
         # End of cycle pause
         cycle_end = datetime.now().strftime('%H:%M:%S')
-        logger.info(f"Cycle complete! {success_count}/{len(tabs)} tabs processed successfully")
+        if self.paused_for_user:
+            logger.info(f"Cycle paused after {success_count}/{len(tabs)} tabs: {self.paused_for_user}")
+            print(f"[{cycle_end}] ⏸  Paused — {self.paused_for_user} "
+                  f"({success_count}/{len(tabs)} tabs done)")
+        else:
+            logger.info(f"Cycle complete! {success_count}/{len(tabs)} tabs processed successfully")
+            print(f"[{cycle_end}] ✅ Cycle complete: {success_count}/{len(tabs)} tabs")
         logger.info(f"Pausing {self.CYCLE_END_PAUSE}s before next cycle...")
-        print(f"[{cycle_end}] ✅ Cycle complete: {success_count}/{len(tabs)} tabs")
 
-        return success_count > 0
+        # A pause is not a failed cycle. Reporting False would make run_continuous and
+        # the LaunchAgent treat a working-hours pause as a malfunction.
+        return success_count > 0 or self.paused_for_user is not None
 
     def _maybe_run_retention(self):
         """Run retention aggregation if enough time has passed (1x per hour)."""

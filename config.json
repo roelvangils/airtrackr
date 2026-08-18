@@ -25,6 +25,12 @@
         "enabled": true,
         "sync_interval_seconds": 3600
     },
+    "automation": {
+        "_note": "Reading Find My steals focus, so the tracker stands down while the Mac is in use. Any input pauses it immediately; it resumes once the Mac has been idle this long. Set to 0 to disable.",
+        "resume_after_idle_seconds": 300,
+        "read_details": true,
+        "_note_details": "read_details: select each Find My row to harvest its street-level address (the list alone only shows the city). Adds ~3s per tab."
+    },
     "database": {
         "backup_enabled": true,
         "backup_interval_hours": 24,
