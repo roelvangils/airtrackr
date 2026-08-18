@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AirTrackr dashboard: serves the BUILT bundle (dashboard/dist) on port 3000.
+
+  Do not load this file directly — it contains @@REPO@@/@@BUN@@ placeholders.
+  Run ./launchd/install.sh, which fills them in, builds the bundle, and installs
+  into ~/Library/LaunchAgents.
+
+  This deliberately serves the production build via `vite preview`, not the dev
+  server: no file watcher, no HMR socket, and the exact artifact a deploy would
+  serve. `vite preview` is used rather than a bare static server because the
+  dashboard routes with pushState, so deep links need the SPA fallback to
+  index.html that it provides.
+
+  Two consequences worth knowing:
+  - Vite inlines VITE_API_KEY from dashboard/.env into the bundle at BUILD time.
+    Rotate the key and the dashboard keeps using the old one until
+    `bun run build` runs again — install.sh rebuilds on every install.
+  - It binds 127.0.0.1 on purpose, like the API. View it from another machine
+    over an SSH tunnel, not by exposing the port.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.airtrackr.dashboard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@@BUN@@</string>
+        <string>run</string>
+        <string>preview</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>3000</string>
+        <string>--strictPort</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@@REPO@@/dashboard</string>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <key>StandardOutPath</key>
+    <string>@@REPO@@/logs/dashboard.log</string>
+    <key>StandardErrorPath</key>
+    <string>@@REPO@@/logs/dashboard.log</string>
+</dict>
+</plist>

@@ -12,7 +12,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
-LABELS=(com.airtrackr.display com.airtrackr.api com.airtrackr.tracker)
+LABELS=(com.airtrackr.display com.airtrackr.api com.airtrackr.tracker com.airtrackr.dashboard)
 
 uninstall() {
     for label in "${LABELS[@]}"; do
@@ -79,11 +79,27 @@ fi
 mkdir -p "$AGENTS_DIR" "$REPO/logs"
 chmod +x "$REPO/launchd/prepare-session.sh"
 
+# The dashboard agent serves the BUILT bundle, so build it now. Vite inlines
+# VITE_API_KEY from dashboard/.env at build time — rebuilding on every install is
+# what keeps a rotated key from silently living on in an old bundle.
+BUN="$(command -v bun || true)"
+if [ -z "$BUN" ]; then
+    echo "Warning: bun not found — skipping the dashboard agent (API and tracker unaffected)." >&2
+    LABELS=(com.airtrackr.display com.airtrackr.api com.airtrackr.tracker)
+else
+    echo "Building dashboard..."
+    (cd "$REPO/dashboard" && "$BUN" install --silent && "$BUN" run build >/dev/null)
+    if [ ! -f "$REPO/dashboard/dist/index.html" ]; then
+        echo "Warning: dashboard build produced no dist/ — skipping its agent." >&2
+        LABELS=(com.airtrackr.display com.airtrackr.api com.airtrackr.tracker)
+    fi
+fi
+
 for label in "${LABELS[@]}"; do
     template="$REPO/launchd/$label.plist.template"
     target="$AGENTS_DIR/$label.plist"
 
-    sed "s|@@REPO@@|$REPO|g" "$template" > "$target"
+    sed -e "s|@@REPO@@|$REPO|g" -e "s|@@BUN@@|$BUN|g" "$template" > "$target"
 
     # bootout first so a reinstall picks up the new plist rather than silently
     # keeping the already-loaded one. bootout is not synchronous: bootstrapping straight

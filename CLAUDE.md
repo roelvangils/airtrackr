@@ -255,10 +255,18 @@ gitignored. Do not commit it.
 
 ## Running under launchd
 
-`./launchd/install.sh` installs the API and tracker agents. Both are LaunchAgents with
+`./launchd/install.sh` installs four agents: `display` (virtual display + Find My,
+see prepare-session.sh), `api`, `tracker`, and `dashboard`. All are LaunchAgents with
 `LimitLoadToSessionType Aqua`, and that is not a detail: Accessibility only works inside
 a GUI login session, so the tracker cannot run at the login window. It starts when the
 user logs in, not at boot — keep auto-login on if it must survive a reboot unattended.
+
+The dashboard agent serves the **built** bundle (`vite preview` over `dashboard/dist`),
+not the dev server. Two consequences: `install.sh` rebuilds the bundle on every install
+because Vite inlines `VITE_API_KEY` at build time (a rotated key needs a rebuild, or the
+dashboard keeps sending the old one), and `bun run dev` on port 3000 will conflict with
+the agent — stop it first (`launchctl bootout gui/$(id -u)/com.airtrackr.dashboard`)
+when developing.
 
 Two permission walls, and they fail in different ways:
 
