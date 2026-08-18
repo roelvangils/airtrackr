@@ -28,6 +28,18 @@ DB_PATH = Path(os.environ.get("AIRTRACKR_DB", Path(__file__).resolve().parent / 
 SCHEMA_VERSION = 6
 
 
+def utc_now_str() -> str:
+    """
+    Now, in the one format this database speaks: naive UTC, space separator.
+
+    Every timestamp comparison in this project must go through this (or match it
+    exactly). Two separate bugs — the duplicate check and trip detection — came
+    from hand-rolling `datetime.now().isoformat()` instead: local time AND a 'T'
+    separator that sorts after the stored ' '.
+    """
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+
 @contextmanager
 def get_connection(db_path: Optional[Path] = None):
     """
@@ -638,34 +650,33 @@ def is_duplicate(
     device_name: str,
     location: str,
     heartbeat_minutes: int = 60,
-    coarse_fallback: Optional[str] = None,
+    coarse_label: Optional[str] = None,
+    has_street: bool = False,
 ) -> bool:
     """
     Skip saving if the device is still at the same location.
 
-    Only saves a new record when:
-    - The location has CHANGED from the last known location, OR
-    - At least heartbeat_minutes have passed (hourly heartbeat to confirm presence)
-
-    This comparison is what makes the table a true "last known location" history:
-    a parked car is one row plus hourly heartbeats, no matter how often the tracker
-    looks. The check runs against the device's most recent row regardless of its
+    Only saves a new record when the location CHANGED, or heartbeat_minutes have
+    passed. The check runs against the device's most recent row regardless of its
     location, so A -> B -> A within the heartbeat window records all three moves.
+    This is what makes the table a true "last known location" history: a parked car
+    is one row plus hourly heartbeats, no matter how often the tracker looks.
 
-    coarse_fallback handles a wrinkle introduced by street-level addresses: rows
-    normally store the street ("Kortrijksesteenweg, Ghent"), but when the details
-    sweep misses a row it degrades to the plain list label ("Ghent"). That is the
-    same physical location, not a move — without this, every sweep miss would write
-    a spurious "moved to Ghent" row and a "moved back" row the cycle after. Pass the
-    plain label when (and only when) the new row has no street address; the last
-    row's own plain label lives in its raw_data.
+    "Changed" is judged at the best precision BOTH rows share. Street addresses come
+    from the details sweep, which can miss a row for one cycle — so a street on one
+    side and a coarse list label on the other is compared coarse-vs-coarse, in both
+    directions. The first version of this guard only covered street->coarse and
+    compared against raw_data's location field, which for details-parsed rows held
+    the street itself — the comparison could never match, and sweep misses wrote the
+    exact spurious there-and-back rows the guard existed to prevent.
 
     Args:
         conn: Active database connection
         device_name: Device name to check
-        location: Location text to check
+        location: The location being stored (street when available, else the label)
         heartbeat_minutes: Max time between records at same location (default 60)
-        coarse_fallback: The plain list label, when the new row lacks a street address
+        coarse_label: The plain list label for the new row ("Ghent", "Home")
+        has_street: Whether `location` is a street-level address
 
     Returns:
         True if the record should be skipped (duplicate)
@@ -686,24 +697,21 @@ def is_duplicate(
         return False  # First record for this device — always save
 
     last_location, last_timestamp, last_coarse = row
+    last_has_street = last_coarse is not None and last_location != last_coarse
 
-    same_place = last_location == location
-    if not same_place and coarse_fallback is not None:
-        # New row is street-less; same underlying list label counts as same place.
-        same_place = last_coarse == coarse_fallback
+    if has_street and last_has_street:
+        same_place = last_location == location
+    elif coarse_label is not None and last_coarse is not None:
+        same_place = last_coarse == coarse_label
+    else:
+        same_place = last_location == location
 
     # Location changed — always save
     if not same_place:
         return False
 
-    # Same location — only save if heartbeat interval has passed.
-    #
-    # The comparison is a string comparison against the stored format, and the rows
-    # store UTC with a space separator ("2026-08-18 13:24:17"). This used to compare
-    # against local time in isoformat ("2026-08-18T15:24:17"): the timezone offset was
-    # wrong AND "T" sorts after " ", so every stored timestamp compared as older than
-    # the cutoff — the dedup never suppressed anything and the table grew one row per
-    # device per cycle regardless of movement.
+    # Same location — only save if heartbeat interval has passed. String comparison
+    # against the stored format; see utc_now_str for why nothing else is acceptable.
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=heartbeat_minutes)) \
         .strftime('%Y-%m-%d %H:%M:%S')
     return last_timestamp > cutoff

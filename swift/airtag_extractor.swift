@@ -209,6 +209,11 @@ let noLocationLiterals: Set<String> = ["no location found", "location not availa
 let proximityLiterals: Set<String> = ["nearby", "here", "with you"]
 let addressUnavailableLiterals: Set<String> = ["address unavailable", "no address found"]
 
+/// Presence indicators Find My glues onto a person's address ("Kleiryt, Merksplas,
+/// Live") that come and go between reads. State, not geography — they must never
+/// survive into an address or the same house reads as a move on every flip.
+let presenceLiterals: Set<String> = ["live"]
+
 /// Labels that describe an action rather than the device, contributed by rows that
 /// expose themselves as a button (package-tracking rows do).
 let actionLabels: Set<String> = ["open details", "show details"]
@@ -453,13 +458,15 @@ func parseSelectedRow(text: String, index: Int, includeRaw: Bool) -> ParsedRow? 
         }
     }
 
-    parts.removeAll { $0 == "Live" }   // presence indicator, not part of the address
+    parts.removeAll { presenceLiterals.contains($0.lowercased()) }
     let address: String? = (parts.isEmpty || parts.contains(where: { isNoLocation($0) }))
         ? nil : parts.joined(separator: ", ")
-    // The zone label ("Home") is what the plain list would have shown, so it keeps the
-    // location field consistent across selected and unselected reads; the street goes
-    // in `address` either way.
-    let location = zone ?? address
+    // `location` is the COARSE label — the zone ("Home") or the city (the address's
+    // last component) — never the full street. The plain list shows the coarse label,
+    // and the tracker's duplicate check compares raw_data's location field as that
+    // stable label; putting the street here defeated the comparison and let sweep
+    // misses write spurious move rows. The street lives in `address`, nowhere else.
+    let location = zone ?? (address != nil ? parts.last : nil)
 
     let row = DeviceRow(
         index: index,
@@ -651,11 +658,7 @@ func parseEnrichedAddress(_ text: String) -> String? {
     // None of that is an address.
     if parts.contains(where: { isNoLocation($0) }) { return nil }
 
-    // People sharing their live position get a "Live" indicator glued onto the
-    // address ("Kleiryt, Merksplas, Live") that comes and goes between reads. It is
-    // presence state, not geography — leaving it in made the same house read as a
-    // move every time the indicator flipped.
-    parts.removeAll { $0 == "Live" }
+    parts.removeAll { presenceLiterals.contains($0.lowercased()) }
 
     let address = parts.joined(separator: ", ").trimmingCharacters(in: .whitespaces)
     return address.isEmpty ? nil : address

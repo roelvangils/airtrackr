@@ -24,9 +24,11 @@ export class DevicesView {
     renderDeviceCard(device) {
         const deviceId = device.device_name; // Swift API uses device_name as identifier
         const deviceName = device.device_name;
-        // Parse timestamps - API returns UTC without timezone suffix, need to append 'Z'
-        const lastSeenDate = device.last_seen ? new Date(device.last_seen + 'Z') : null;
-        const firstSeenDate = device.first_seen ? new Date(device.first_seen + 'Z') : null;
+        // The API serialises timestamps with an explicit UTC offset ('...Z') since
+        // schema v6 — appending another 'Z' here produced '...ZZ' and Invalid Date
+        // on every card. Parse as-is; Date renders in the viewer's local time.
+        const lastSeenDate = device.last_seen ? new Date(device.last_seen) : null;
+        const firstSeenDate = device.first_seen ? new Date(device.first_seen) : null;
 
         const lastSeen = lastSeenDate ? lastSeenDate.toLocaleString() : 'Never';
         const locationCount = device.location_count || 0;

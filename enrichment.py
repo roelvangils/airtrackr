@@ -12,7 +12,7 @@ Provides:
 
 import math
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from db import get_connection, resolve_location_alias
@@ -125,7 +125,10 @@ def detect_trips(device_name: str, since_minutes: int = 10, conn=None) -> int:
     Returns:
         Number of trips detected
     """
-    cutoff = (datetime.now() - timedelta(minutes=since_minutes)).isoformat()
+    # Stored-format UTC — the local-time isoformat() this used to build compared
+    # newer than every stored row (wrong offset AND 'T' > ' '), so the query matched
+    # zero rows and trip detection was permanently dead in UTC+ timezones.
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=since_minutes)).strftime('%Y-%m-%d %H:%M:%S')
 
     def _detect(conn, should_commit):
         cursor = conn.cursor()

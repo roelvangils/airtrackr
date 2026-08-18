@@ -542,10 +542,12 @@ class OrchestratedAirTagTracker:
 
                     # Only write when the device actually moved (or the hourly
                     # heartbeat is due) — this is what keeps a 1-minute cadence from
-                    # multiplying the table. When the details sweep missed this row,
-                    # its coarse label must not read as a move; see is_duplicate.
-                    coarse = None if cleaned.get('address') else cleaned['location']
-                    if is_duplicate(conn, device_name, location_text, coarse_fallback=coarse):
+                    # multiplying the table. The plain label and the street-ness flag
+                    # let is_duplicate compare at the precision both rows share, in
+                    # both directions; see its docstring.
+                    if is_duplicate(conn, device_name, location_text,
+                                    coarse_label=cleaned['location'],
+                                    has_street=bool(cleaned.get('address'))):
                         logger.debug(f"Skipping duplicate: {device_name} at {location_text}")
                         # Update last_seen in swift_devices, even without a new location record
                         cursor.execute('''
@@ -625,7 +627,9 @@ class OrchestratedAirTagTracker:
                     saved_device_names.add(device_name)
 
                     # Track visit (dwell time) — reuse conn to avoid locking
-                    ts = location_timestamp or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    # UTC like location_timestamp itself — a local fallback here skewed visit
+                    # durations by the timezone offset when time_status was unparsed.
+                    ts = location_timestamp or datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
                     try:
                         update_visits(device_name, location_text, latitude, longitude, ts, conn=conn)
                     except Exception as e:
@@ -636,9 +640,13 @@ class OrchestratedAirTagTracker:
                 if saved_count > 0:
                     print(f"           💾 {device_type}: {saved_count} saved")
 
-            except Exception as e:
-                logger.error(f"Error saving {device_type} tab: {e}")
+            except Exception:
+                # Roll back and RE-RAISE. Returning (0, set()) here made a failed
+                # write indistinguishable from "nothing moved", while the rollback
+                # also discarded the last_seen updates — so the cycle reported 3/3
+                # with a database that had silently absorbed nothing.
                 conn.rollback()
+                raise
                 return 0, set()
 
         return saved_count, saved_device_names
@@ -1024,8 +1032,15 @@ class OrchestratedAirTagTracker:
                       f"{device.get('time_status') or '-'}")
             return True
 
-        # Save to database
-        saved, device_names = self.save_locations(devices, actual_type)
+        # Save to database. A write failure is a failed tab, not a quiet zero —
+        # but it is not Find My's fault either, so it stays out of the
+        # consecutive-failure counter that triggers Find My restarts.
+        try:
+            saved, device_names = self.save_locations(devices, actual_type)
+        except Exception as e:
+            logger.error(f"Saving {tab_name} tab failed: {e}")
+            print(f"           ❌ {tab_name}: opslag mislukt: {e}")
+            return False
 
         # Detect trips for each device that had new records (uses resolved names)
         if saved > 0:
@@ -1193,6 +1208,11 @@ class OrchestratedAirTagTracker:
                     break
 
                 schedule.run_pending()
+                # Retention has its own hourly gate; without this call it simply never
+                # ran — its only other call site is run_continuous, and the LaunchAgent
+                # uses --schedule. The table would have grown unbounded on a machine
+                # meant to run unattended for months.
+                self._maybe_run_retention()
                 time.sleep(1)
         except KeyboardInterrupt:
             logger.info("\n\n🛑 Orchestrated tracking stopped by user")

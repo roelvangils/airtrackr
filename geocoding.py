@@ -10,7 +10,7 @@ import time
 import logging
 from typing import Tuple, Optional, Dict
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from db import get_connection
 
@@ -53,61 +53,82 @@ class Geocoder:
                 'cache_duration_days': 7
             }
 
-    def _check_cache(self, location_text: str) -> Optional[Tuple[float, float]]:
-        """Check if location is in cache (main database) and not expired"""
+    # Failed lookups are cached for a shorter time than successes: an address may
+    # start resolving (typo fixed upstream, Nominatim data added), but while the
+    # negative entry is fresh it must count as an ANSWER, not a miss. Before this,
+    # negative rows were written but read back as misses, so every un-geocodable
+    # label cost two Nominatim round-trips plus 2.2s of rate-limit sleep on every
+    # single cycle — thousands of requests a day against a free tier, for nothing.
+    NEGATIVE_CACHE_DAYS = 1
+
+    def _cache_row(self, location_text: str, columns: str):
+        """
+        Fetch a cache row and classify it: a (row, is_negative) tuple, or None.
+
+        Freshness is decided here in Python, in UTC — created_at is stored as UTC
+        by SQLite's CURRENT_TIMESTAMP, and the SQL-side comparison this replaces
+        bound a local-time value, silently shifting every TTL by the local offset.
+        """
         if not self.config.get('cache_results', True):
             return None
 
-        cache_days = self.config.get('cache_duration_days', 7)
-        cutoff_date = datetime.now() - timedelta(days=cache_days)
-
         with get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT latitude, longitude
-                FROM geocoding_cache
-                WHERE location_text = ? AND created_at > ?
-            ''', (location_text.strip(), cutoff_date))
-
-            result = cursor.fetchone()
-
-        if result and result[0] is not None and result[1] is not None:
-            logger.debug(f"Cache hit for '{location_text}'")
-            return (result[0], result[1])
-
-        return None
-
-    def _check_cache_full(self, location_text: str) -> Optional[Dict]:
-        """Check cache for full structured address data."""
-        if not self.config.get('cache_results', True):
+            result = conn.execute(
+                f'''SELECT {columns}, created_at FROM geocoding_cache
+                    WHERE location_text = ?''',
+                (location_text.strip(),),
+            ).fetchone()
+        if result is None:
             return None
 
-        cache_days = self.config.get('cache_duration_days', 7)
-        cutoff_date = datetime.now() - timedelta(days=cache_days)
+        try:
+            created = datetime.strptime(result[-1], '%Y-%m-%d %H:%M:%S')
+        except (TypeError, ValueError):
+            return None
+        age = datetime.now(timezone.utc).replace(tzinfo=None) - created
 
-        with get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT latitude, longitude, street, house_number, postal_code, city, country, address_json
-                FROM geocoding_cache
-                WHERE location_text = ? AND created_at > ?
-            ''', (location_text.strip(), cutoff_date))
+        is_negative = result[0] is None or result[1] is None
+        max_age = timedelta(days=self.NEGATIVE_CACHE_DAYS if is_negative
+                            else self.config.get('cache_duration_days', 7))
+        if age > max_age:
+            return None
+        return result, is_negative
 
-            result = cursor.fetchone()
+    def _check_cache(self, location_text: str):
+        """
+        Cached coordinates: a (lat, lon) tuple, False for a fresh negative
+        ("we asked recently; it does not resolve"), or None for a miss.
+        """
+        hit = self._cache_row(location_text, "latitude, longitude")
+        if hit is None:
+            return None
+        result, is_negative = hit
+        if is_negative:
+            logger.debug(f"Negative cache hit for '{location_text}'")
+            return False
+        logger.debug(f"Cache hit for '{location_text}'")
+        return (result[0], result[1])
 
-        if result and result[0] is not None and result[1] is not None:
-            return {
-                'latitude': result[0],
-                'longitude': result[1],
-                'street': result[2],
-                'house_number': result[3],
-                'postal_code': result[4],
-                'city': result[5],
-                'country': result[6],
-                'address_json': result[7],
-            }
-
-        return None
+    def _check_cache_full(self, location_text: str):
+        """Full structured cache entry, False for a fresh negative, None for a miss."""
+        hit = self._cache_row(
+            location_text,
+            "latitude, longitude, street, house_number, postal_code, city, country, address_json")
+        if hit is None:
+            return None
+        result, is_negative = hit
+        if is_negative:
+            return False
+        return {
+            'latitude': result[0],
+            'longitude': result[1],
+            'street': result[2],
+            'house_number': result[3],
+            'postal_code': result[4],
+            'city': result[5],
+            'country': result[6],
+            'address_json': result[7],
+        }
 
     def _save_to_cache(self, location_text: str, latitude: Optional[float], longitude: Optional[float],
                        address: Optional[Dict] = None):
@@ -360,8 +381,11 @@ class Geocoder:
         if not cleaned_text:
             return None
 
-        # Check cache for full data
+        # Check cache for full data. False means a fresh negative: we asked
+        # recently and it does not resolve — that is an answer, not a miss.
         cached = self._check_cache_full(cleaned_text)
+        if cached is False:
+            return None
         if cached:
             return cached
 
@@ -435,9 +459,12 @@ class Geocoder:
         if custom_result:
             return custom_result
         
-        # Check cache
+        # Check cache. False means a fresh negative — return (None, None) without
+        # touching Nominatim; see _cache_row.
         cached_result = self._check_cache(cleaned_text)
-        if cached_result:
+        if cached_result is False:
+            return (None, None)
+        if cached_result is not None:
             return cached_result
         
         # Geocode based on provider

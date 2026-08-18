@@ -283,6 +283,21 @@ def parse_datetime(value: str) -> datetime:
     """
     return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
 
+
+def db_timestamp(dt: datetime) -> str:
+    """
+    Format a datetime for comparison against stored rows.
+
+    Rows store naive UTC with a space separator ('2026-08-18 13:24:17'). SQLite
+    compares these as strings, so binding isoformat() is doubly wrong: the 'T'
+    separator sorts after ' ' (dropping every row on the cutoff's calendar date),
+    and an attached offset ('+00:00') makes it worse. Convert aware values to UTC,
+    assume naive ones already are, and emit the stored format exactly.
+    """
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
+
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Calculate distance in meters between two lat/lon points."""
     return haversine_km(lat1, lon1, lat2, lon2) * 1000
@@ -385,7 +400,14 @@ def _is_night_mode_active() -> bool:
 
 
 def _get_temp_wake_expiry() -> Optional[datetime]:
-    """Get temp wake expiry time, or None if not active/expired."""
+    """
+    Get temp wake expiry time, or None if not active/expired.
+
+    The flag file deliberately stays in naive LOCAL time: it is written, read and
+    compared only by processes on this machine within a 30-minute window, and the
+    tracker reads the same file with the same local clock. Do not "fix" it to UTC
+    in isolation — both writers and both readers must move together.
+    """
     if not TEMP_WAKE_FLAG.exists():
         return None
     try:
@@ -468,8 +490,13 @@ async def health_check():
             cursor.execute("SELECT COUNT(*) FROM swift_locations")
             location_count = cursor.fetchone()[0]
 
-            # Use extracted_at for tracking health (when we last collected data)
-            cursor.execute("SELECT MAX(extracted_at) FROM swift_locations")
+            # Staleness is judged on swift_devices.last_seen, not on the newest
+            # location row: with change-only writes, a parked fleet inserts at most
+            # one heartbeat row per device per hour, so MAX(extracted_at) can be
+            # ~an hour old on a perfectly healthy tracker. last_seen is touched on
+            # every successful cycle regardless of movement — it distinguishes
+            # "nothing moved" from "scrape broken", which is this check's entire job.
+            cursor.execute("SELECT MAX(last_seen) FROM swift_devices")
             last_update = cursor.fetchone()[0]
             if last_update:
                 last_update = parse_datetime(last_update)
@@ -492,11 +519,13 @@ async def health_check():
             tracker_warning = None
 
             if last_update:
-                now = datetime.now()
-                # Handle timezone-naive comparison
-                if last_update.tzinfo is not None:
-                    from datetime import timezone as tz
-                    now = now.replace(tzinfo=tz.utc)
+                # UTC, and genuinely converted. The old code stamped naive LOCAL
+                # wall-clock time with tzinfo=utc — a relabel, not a conversion —
+                # which inflated the age by the local offset: a minute-old reading
+                # counted as two hours old, /health reported a healthy tracker as
+                # degraded, and the inflated value triggered spurious night-mode
+                # wakes via _maybe_trigger_wake below.
+                now = datetime.now(timezone.utc)
                 delta = now - last_update
                 minutes_since_extraction = int(delta.total_seconds() / 60)
 
@@ -729,10 +758,10 @@ async def get_device_history(
 
         if start_date:
             where_clauses.append("l.timestamp >= ?")
-            params.append(start_date.isoformat())
+            params.append(db_timestamp(start_date))
         if end_date:
             where_clauses.append("l.timestamp <= ?")
-            params.append(end_date.isoformat())
+            params.append(db_timestamp(end_date))
 
         where = " AND ".join(where_clauses)
 
@@ -775,10 +804,10 @@ async def export_device(
 
         if start_date:
             where_clauses.append("timestamp >= ?")
-            params.append(start_date.isoformat())
+            params.append(db_timestamp(start_date))
         if end_date:
             where_clauses.append("timestamp <= ?")
-            params.append(end_date.isoformat())
+            params.append(db_timestamp(end_date))
 
         where = " AND ".join(where_clauses)
         cursor.execute(f"""
@@ -835,10 +864,10 @@ async def get_device_trips(
 
         if start_date:
             where_clauses.append("start_time >= ?")
-            params.append(start_date.isoformat())
+            params.append(db_timestamp(start_date))
         if end_date:
             where_clauses.append("end_time <= ?")
-            params.append(end_date.isoformat())
+            params.append(db_timestamp(end_date))
 
         where = " AND ".join(where_clauses)
 
@@ -880,10 +909,10 @@ async def get_device_visits(
 
         if start_date:
             where_clauses.append("arrival_time >= ?")
-            params.append(start_date.isoformat())
+            params.append(db_timestamp(start_date))
         if end_date:
             where_clauses.append("(departure_time IS NULL OR departure_time <= ?)")
-            params.append(end_date.isoformat())
+            params.append(db_timestamp(end_date))
 
         where = " AND ".join(where_clauses)
 
@@ -1100,10 +1129,10 @@ async def search_locations(
             params.append(device_name)
         if start_date:
             where_clauses.append("timestamp >= ?")
-            params.append(start_date.isoformat())
+            params.append(db_timestamp(start_date))
         if end_date:
             where_clauses.append("timestamp <= ?")
-            params.append(end_date.isoformat())
+            params.append(db_timestamp(end_date))
 
         where = " AND ".join(where_clauses)
 
@@ -1165,7 +1194,7 @@ async def get_device_stats(
                    MAX(timestamp) as last_movement
             FROM swift_locations
             WHERE device_name = ? AND timestamp >= ?
-        """, (device_name, start_date.isoformat()))
+        """, (device_name, db_timestamp(start_date)))
 
         row = cursor.fetchone()
         if not row or row['total_updates'] == 0:
@@ -1180,7 +1209,7 @@ async def get_device_stats(
             FROM swift_locations
             WHERE device_name = ? AND timestamp >= ?
             GROUP BY location ORDER BY count DESC
-        """, (device_name, start_date.isoformat()))
+        """, (device_name, db_timestamp(start_date)))
 
         location_frequencies = {r['location']: r['count'] for r in cursor.fetchall()}
 
