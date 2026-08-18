@@ -27,7 +27,7 @@
         <string>@@REPO@@/venv/bin/python</string>
         <string>@@REPO@@/orchestrated_tracker.py</string>
         <string>--schedule</string>
-        <string>5</string>
+        <string>1</string>
     </array>
 
     <key>WorkingDirectory</key>

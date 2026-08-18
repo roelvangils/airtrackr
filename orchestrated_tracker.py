@@ -150,9 +150,16 @@ class OrchestratedAirTagTracker:
     """
 
     # Timing configuration (in seconds)
-    INITIAL_PAUSE = 5      # Initial pause before starting
-    EXTRACT_PAUSE = 15     # Pause after extracting data
-    CYCLE_END_PAUSE = 60   # Pause at end of cycle before repeating
+    #
+    # Sized so a full cycle (three tabs, details sweeps included) finishes in ~30s,
+    # comfortably inside the 1-minute schedule. The old 15s EXTRACT_PAUSE dated from
+    # the screenshot era, when nothing verified that the UI had settled; the extractor
+    # now confirms the tab switch against the heading and polls the row count, so the
+    # long blind pause bought nothing. The scheduler runs cycles on one thread, so an
+    # overlong cycle delays the next one rather than stacking on top of it.
+    INITIAL_PAUSE = 2      # Initial pause before starting
+    EXTRACT_PAUSE = 2      # Pause after extracting data
+    CYCLE_END_PAUSE = 60   # Pause at end of cycle before repeating (continuous mode)
 
     # Handed to the extractor, which waits for the tab switch to be confirmed and
     # then for the row count to stop changing. This replaced a blind per-tab sleep
@@ -527,8 +534,12 @@ class OrchestratedAirTagTracker:
                     # held whatever Find My showed, and the selected row simply shows more.
                     location_text = cleaned.get('address') or cleaned['location']
 
-                    # Skip duplicates within 2-minute window
-                    if is_duplicate(conn, device_name, location_text):
+                    # Only write when the device actually moved (or the hourly
+                    # heartbeat is due) — this is what keeps a 1-minute cadence from
+                    # multiplying the table. When the details sweep missed this row,
+                    # its coarse label must not read as a move; see is_duplicate.
+                    coarse = None if cleaned.get('address') else cleaned['location']
+                    if is_duplicate(conn, device_name, location_text, coarse_fallback=coarse):
                         logger.debug(f"Skipping duplicate: {device_name} at {location_text}")
                         # Update last_seen in swift_devices, even without a new location record
                         cursor.execute('''
@@ -1020,7 +1031,13 @@ class OrchestratedAirTagTracker:
                         logger.warning(f"Trip detection failed for {name}: {e}")
                 conn.commit()
 
-        return saved > 0
+        # A tab where nothing was written is still a SUCCESSFUL tab: with the
+        # duplicate check doing its job, "0 saved" is the normal steady state of a
+        # world where nothing moved. Freshness is tracked separately — every cycle
+        # touches swift_devices.last_seen even when it stores no row, which is what
+        # lets the API tell "parked for hours" apart from "scrape broken for hours"
+        # (minutes_since_update is computed from last_seen).
+        return True
 
     def run_single_cycle(self) -> bool:
         """
@@ -1029,7 +1046,8 @@ class OrchestratedAirTagTracker:
         Returns:
             True if at least one tab was successfully processed
         """
-        cycle_start = datetime.now().strftime('%H:%M:%S')
+        cycle_started = datetime.now()
+        cycle_start = cycle_started.strftime('%H:%M:%S')
         logger.info("=" * 70)
         logger.info("STARTING NEW TRACKING CYCLE")
         logger.info("=" * 70)
@@ -1076,14 +1094,19 @@ class OrchestratedAirTagTracker:
                 time.sleep(self.EXTRACT_PAUSE)
 
         # End of cycle pause
+        cycle_seconds = (datetime.now() - cycle_started).total_seconds()
         cycle_end = datetime.now().strftime('%H:%M:%S')
         if self.paused_for_user:
             logger.info(f"Cycle paused after {success_count}/{len(tabs)} tabs: {self.paused_for_user}")
             print(f"[{cycle_end}] ⏸  Paused — {self.paused_for_user} "
                   f"({success_count}/{len(tabs)} tabs done)")
         else:
-            logger.info(f"Cycle complete! {success_count}/{len(tabs)} tabs processed successfully")
-            print(f"[{cycle_end}] ✅ Cycle complete: {success_count}/{len(tabs)} tabs")
+            logger.info(f"Cycle complete! {success_count}/{len(tabs)} tabs "
+                        f"in {cycle_seconds:.0f}s")
+            print(f"[{cycle_end}] ✅ Cycle complete: {success_count}/{len(tabs)} tabs ({cycle_seconds:.0f}s)")
+            if cycle_seconds > 55:
+                logger.warning(f"Cycle took {cycle_seconds:.0f}s — longer than the 1-minute "
+                               "schedule; the next run will start late rather than overlap")
         logger.info(f"Pausing {self.CYCLE_END_PAUSE}s before next cycle...")
 
         # A pause is not a failed cycle. Reporting False would make run_continuous and

@@ -12,7 +12,7 @@ import sqlite3
 import logging
 from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict
 
 from dateutil.relativedelta import relativedelta
@@ -602,6 +602,7 @@ def is_duplicate(
     device_name: str,
     location: str,
     heartbeat_minutes: int = 60,
+    coarse_fallback: Optional[str] = None,
 ) -> bool:
     """
     Skip saving if the device is still at the same location.
@@ -610,18 +611,34 @@ def is_duplicate(
     - The location has CHANGED from the last known location, OR
     - At least heartbeat_minutes have passed (hourly heartbeat to confirm presence)
 
+    This comparison is what makes the table a true "last known location" history:
+    a parked car is one row plus hourly heartbeats, no matter how often the tracker
+    looks. The check runs against the device's most recent row regardless of its
+    location, so A -> B -> A within the heartbeat window records all three moves.
+
+    coarse_fallback handles a wrinkle introduced by street-level addresses: rows
+    normally store the street ("Kortrijksesteenweg, Ghent"), but when the details
+    sweep misses a row it degrades to the plain list label ("Ghent"). That is the
+    same physical location, not a move — without this, every sweep miss would write
+    a spurious "moved to Ghent" row and a "moved back" row the cycle after. Pass the
+    plain label when (and only when) the new row has no street address; the last
+    row's own plain label lives in its raw_data.
+
     Args:
         conn: Active database connection
         device_name: Device name to check
         location: Location text to check
         heartbeat_minutes: Max time between records at same location (default 60)
+        coarse_fallback: The plain list label, when the new row lacks a street address
 
     Returns:
         True if the record should be skipped (duplicate)
     """
     row = conn.execute(
         '''
-        SELECT location, timestamp FROM swift_locations
+        SELECT location, timestamp,
+               json_extract(raw_data, '$.location') AS coarse
+        FROM swift_locations
         WHERE device_name = ?
         ORDER BY timestamp DESC
         LIMIT 1
@@ -632,12 +649,25 @@ def is_duplicate(
     if row is None:
         return False  # First record for this device — always save
 
-    last_location, last_timestamp = row
+    last_location, last_timestamp, last_coarse = row
+
+    same_place = last_location == location
+    if not same_place and coarse_fallback is not None:
+        # New row is street-less; same underlying list label counts as same place.
+        same_place = last_coarse == coarse_fallback
 
     # Location changed — always save
-    if last_location != location:
+    if not same_place:
         return False
 
-    # Same location — only save if heartbeat interval has passed
-    cutoff = (datetime.now() - timedelta(minutes=heartbeat_minutes)).isoformat()
+    # Same location — only save if heartbeat interval has passed.
+    #
+    # The comparison is a string comparison against the stored format, and the rows
+    # store UTC with a space separator ("2026-08-18 13:24:17"). This used to compare
+    # against local time in isoformat ("2026-08-18T15:24:17"): the timezone offset was
+    # wrong AND "T" sorts after " ", so every stored timestamp compared as older than
+    # the cutoff — the dedup never suppressed anything and the table grew one row per
+    # device per cycle regardless of movement.
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=heartbeat_minutes)) \
+        .strftime('%Y-%m-%d %H:%M:%S')
     return last_timestamp > cutoff

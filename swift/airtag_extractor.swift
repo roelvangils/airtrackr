@@ -453,6 +453,7 @@ func parseSelectedRow(text: String, index: Int, includeRaw: Bool) -> ParsedRow? 
         }
     }
 
+    parts.removeAll { $0 == "Live" }   // presence indicator, not part of the address
     let address: String? = (parts.isEmpty || parts.contains(where: { isNoLocation($0) }))
         ? nil : parts.joined(separator: ", ")
     // The zone label ("Home") is what the plain list would have shown, so it keeps the
@@ -649,6 +650,12 @@ func parseEnrichedAddress(_ text: String) -> String? {
     // "RoelPods Pro 2, No location found" (an accessory names its parent product).
     // None of that is an address.
     if parts.contains(where: { isNoLocation($0) }) { return nil }
+
+    // People sharing their live position get a "Live" indicator glued onto the
+    // address ("Kleiryt, Merksplas, Live") that comes and goes between reads. It is
+    // presence state, not geography — leaving it in made the same house read as a
+    // move every time the indicator flipped.
+    parts.removeAll { $0 == "Live" }
 
     let address = parts.joined(separator: ", ").trimmingCharacters(in: .whitespaces)
     return address.isEmpty ? nil : address

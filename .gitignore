@@ -40,3 +40,6 @@ dashboard/dist/
 # Debug output from the old screenshot/OCR pipeline
 temp_regions/
 dashboard/node_modules/
+# SQLite sidecar files — the -wal can hold un-checkpointed location rows
+database/*.db-wal
+database/*.db-shm

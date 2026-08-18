@@ -287,6 +287,16 @@ Two permission walls, and they fail in different ways:
 ## Notes
 
 - Geocoding is rate-limited to 1.1s per request (Nominatim free tier).
-- A full cycle over the three tabs takes ~40 seconds.
+- A full cycle over the three tabs takes ~25s, and runs on a 1-minute schedule
+  (~90s effective cadence, since the next run is scheduled after the previous one
+  finishes). The table does not grow with the cadence: `is_duplicate` writes a row
+  only when a device's location CHANGED, plus one heartbeat row per device per hour.
+  Freshness is a separate signal — every cycle touches `swift_devices.last_seen`
+  even when it writes nothing, and the API's `minutes_since_update` derives from it.
+  That is how "parked for two days" (old location row, fresh last_seen) stays
+  distinguishable from "scrape broken for two days" (both old).
+- Find My glues a "Live" indicator onto the address of people sharing their live
+  position; the extractor strips it, because it flips between reads and would
+  otherwise register the same house as a move each time.
 - Readings Find My labels as hours/days old are rejected outright (`_STALE_TIME_RE` in
   `db.py`): they are a stale memory, not a location update.
