@@ -154,6 +154,26 @@ def detect_trips(device_name: str, since_minutes: int = 10, conn=None) -> int:
         ''', (device_name, effective_cutoff))
 
         rows = cursor.fetchall()
+
+        # Anchor the first comparison to the last known position BEFORE the window.
+        # With change-only writes, consecutive movement rows are routinely further
+        # apart than the lookback window, so the first new row often had nothing to
+        # be compared against — every trip that started more than since_minutes
+        # after the previous movement was silently missed (the trips table stayed
+        # empty while the raw rows plainly showed the car moving).
+        cursor.execute('''
+            SELECT id, location, latitude, longitude, timestamp
+            FROM swift_locations
+            WHERE device_name = ?
+              AND latitude IS NOT NULL AND longitude IS NOT NULL
+              AND timestamp <= ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        ''', (device_name, effective_cutoff))
+        anchor = cursor.fetchone()
+        if anchor is not None:
+            rows = [anchor] + rows
+
         if len(rows) < 2:
             return 0
 
