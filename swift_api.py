@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import sqlite3
 from pathlib import Path
 import json
@@ -273,8 +273,15 @@ def parse_period(period: str) -> timedelta:
         return timedelta(weeks=value)
 
 def parse_datetime(value: str) -> datetime:
-    """Parse datetime string from database"""
-    return datetime.fromisoformat(value)
+    """
+    Parse a datetime string from the database, as the UTC instant it is.
+
+    Rows store naive UTC ("2026-08-18 13:24:17"). Returning it naive made every
+    consumer guess, and JavaScript's Date guesses "local" — so the dashboard and
+    kortex displayed UTC readings as if they were local times. Attaching the offset
+    serialises as "...+00:00", which they all convert correctly.
+    """
+    return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
 
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Calculate distance in meters between two lat/lon points."""
@@ -1145,7 +1152,9 @@ async def get_device_stats(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    start_date = datetime.now() - period_delta
+    # UTC, matching the stored timestamps — datetime.now() here silently shifted
+    # every period filter by the local offset.
+    start_date = datetime.now(timezone.utc) - period_delta
 
     with get_connection() as conn:
         cursor = conn.cursor()

@@ -29,6 +29,22 @@ HEIGHT=1200
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
+# --- 0. keep the logs from growing forever ------------------------------------
+# launchd appends to these files for as long as the machine lives; nothing else
+# trims them. Truncating in place is safe with append-mode writers (their next
+# write lands at the new end of file), unlike moving the file, which they would
+# keep writing to by inode. The tracker's own tracker.log rotates itself in
+# Python and is skipped here.
+for logfile in "$REPO"/logs/*.log; do
+    [ -f "$logfile" ] || continue
+    case "$logfile" in *tracker.log) continue ;; esac
+    size=$(stat -f%z "$logfile" 2>/dev/null || echo 0)
+    if [ "$size" -gt 20971520 ]; then   # 20 MB
+        tail -c 2097152 "$logfile" > "$logfile.tmp" && cat "$logfile.tmp" > "$logfile" && rm -f "$logfile.tmp"
+        log "trimmed $(basename "$logfile") from $((size / 1048576))MB to 2MB"
+    fi
+done
+
 # --- 1. the virtual display ---------------------------------------------------
 if pgrep -x DeskPad >/dev/null 2>&1; then
     log "DeskPad already running"

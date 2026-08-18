@@ -10,7 +10,7 @@ Can be run as a CLI script or called from the orchestrated tracker.
 
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import Counter
 
@@ -52,7 +52,9 @@ def aggregate_to_hourly(dry_run: bool = False) -> int:
     """
     config = _load_retention_config()
     raw_days = config.get("raw_data_days", DEFAULT_RAW_DAYS)
-    cutoff = (datetime.now() - timedelta(days=raw_days)).isoformat()
+    # UTC + space separator, matching the stored format — the old local-time
+    # isoformat() cutoff compared wrong on both timezone and 'T'-vs-space.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=raw_days)).strftime('%Y-%m-%d %H:%M:%S')
 
     with get_connection() as conn:
         cursor = conn.cursor()
@@ -172,7 +174,7 @@ def aggregate_to_daily(dry_run: bool = False) -> int:
     """
     config = _load_retention_config()
     hourly_days = config.get("hourly_summary_days", DEFAULT_HOURLY_DAYS)
-    cutoff = (datetime.now() - timedelta(days=hourly_days)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=hourly_days)).strftime('%Y-%m-%d %H:%M:%S')
 
     with get_connection() as conn:
         cursor = conn.cursor()

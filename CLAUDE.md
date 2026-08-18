@@ -221,6 +221,21 @@ plus `geocoding_cache`, `trips`, `visits`, `zones`, `location_summaries`.
 Schema changes go in `db.py` as a numbered `_migrate_to_vN`, with `SCHEMA_VERSION`
 bumped; `init_schema()` applies whatever is pending via `PRAGMA user_version`.
 
+**Every timestamp in the database is UTC** (schema v6), and the API attaches an
+explicit `+00:00`/`Z` on the way out so consumers convert for display. This is a rule
+with a history: before v6, `extracted_at` and `location_timestamp` were local while
+`timestamp` and `last_seen` were UTC, and every comparison that crossed that line was
+silently wrong — the duplicate check never suppressed a row, and retention cutoffs and
+period filters were shifted by the local offset (compounded by `isoformat()`'s "T"
+sorting after the stored format's space). Never compare a timestamp against
+`datetime.now()`; it is `datetime.now(timezone.utc)` with a `%Y-%m-%d %H:%M:%S` format,
+everywhere.
+
+The data was restarted fresh on 2026-08-18 (pre-v6 file in `database/backups/`,
+gitignored). The WAL is bounded by `journal_size_limit`; `database/` must never be
+committed — a rollback journal once sat in the public git history carrying real
+location data, and the whole path is purged and ignored (`*.db-wal`/`-shm` included).
+
 `DB_PATH` is anchored to the repo (override with `AIRTRACKR_DB`). It used to be
 relative, which silently created a second empty database when the process was
 started from another directory.
@@ -298,5 +313,9 @@ Two permission walls, and they fail in different ways:
 - Find My glues a "Live" indicator onto the address of people sharing their live
   position; the extractor strips it, because it flips between reads and would
   otherwise register the same house as a move each time.
+- Logs are bounded for unattended operation: tracker.log rotates itself (10MB x 3),
+  and prepare-session.sh trims any other logs/*.log past 20MB. launchd appends by
+  file descriptor, so trimming truncates in place — moving the file would leave the
+  writer appending to the old inode forever.
 - Readings Find My labels as hours/days old are rejected outright (`_STALE_TIME_RE` in
   `db.py`): they are a stale memory, not a location update.

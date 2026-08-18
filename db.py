@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path(os.environ.get("AIRTRACKR_DB", Path(__file__).resolve().parent / "database" / "airtracker.db"))
 
 # Current schema version — bump this when adding migrations
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 @contextmanager
@@ -50,6 +50,9 @@ def get_connection(db_path: Optional[Path] = None):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=15000")
+    # Bound the WAL: on a machine that runs unattended for months, an unchecked WAL
+    # is disk growth nobody notices until it hurts. Checkpoints trim it to this.
+    conn.execute("PRAGMA journal_size_limit=8388608")
     try:
         yield conn
     finally:
@@ -80,6 +83,9 @@ def init_schema():
 
         if current_version < 5:
             _migrate_to_v5(conn)
+
+        if current_version < 6:
+            _migrate_to_v6(conn)
 
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
@@ -513,7 +519,9 @@ def _time_status_to_timestamp(time_status: str, base_time: Optional[datetime] = 
     Returns:
         ISO timestamp string, or None if the pattern is not recognized (e.g. "Paused").
     """
-    now = base_time or datetime.now()
+    # UTC, like every other timestamp in this database (see _migrate_to_v6). Mixing
+    # local time in here is what broke the duplicate check for months.
+    now = base_time or datetime.now(timezone.utc)
     for pattern, delta_fn in _RELATIVE_TIME_RULES_TD:
         m = pattern.match(time_status)
         if m:
@@ -595,6 +603,34 @@ def resolve_device_alias(device_name: str) -> str:
     except Exception:
         pass
     return device_name
+
+
+def _migrate_to_v6(conn: sqlite3.Connection):
+    """
+    Migration to v6: every timestamp in the database is UTC, without exception.
+
+    Until v5 the columns disagreed: `timestamp` and `last_seen` were UTC (SQLite's
+    CURRENT_TIMESTAMP), while `extracted_at` and `location_timestamp` were written in
+    local time. That split produced a family of latent comparison bugs — the duplicate
+    check and the retention cutoffs compared local `isoformat()` strings (with a "T")
+    against stored UTC strings (with a space), and since "T" sorts after " ", the
+    comparisons were wrong in both timezone and format. The dedup never suppressed a
+    row because of it.
+
+    Naive local values are converted here; the API attaches an explicit UTC offset on
+    the way out, so consumers (dashboard, kortex) convert to local time for display.
+    """
+    logger.info("Migrating to v6: converting local-time columns to UTC")
+    conn.execute("""
+        UPDATE swift_locations
+        SET extracted_at = datetime(extracted_at, 'utc')
+        WHERE extracted_at IS NOT NULL AND extracted_at != ''
+    """)
+    conn.execute("""
+        UPDATE swift_locations
+        SET location_timestamp = datetime(location_timestamp, 'utc')
+        WHERE location_timestamp IS NOT NULL AND location_timestamp != ''
+    """)
 
 
 def is_duplicate(

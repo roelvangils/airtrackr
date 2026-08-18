@@ -25,6 +25,7 @@ import os
 import sys
 import time
 import logging
+import logging.handlers
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -88,12 +89,16 @@ class ExtractionResult:
 LOG_DIR = REPO_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
+# Rotating, because this process is meant to run unattended for months: at one
+# cycle per minute a plain FileHandler writes hundreds of MB per year and nothing
+# would ever trim it. 10MB x 3 backups ≈ a few weeks of history, bounded forever.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        logging.FileHandler(LOG_DIR / 'tracker.log')
+        logging.handlers.RotatingFileHandler(
+            LOG_DIR / 'tracker.log', maxBytes=10 * 1024 * 1024, backupCount=3)
     ]
 )
 logger = logging.getLogger(__name__)
@@ -517,14 +522,15 @@ class OrchestratedAirTagTracker:
                         logger.debug(f"Skipping {device_data['name']}: no usable location")
                         continue
 
-                    # Parse extracted_at timestamp (Swift outputs UTC with Z suffix)
+                    # Parse extracted_at timestamp (Swift outputs UTC with Z suffix).
+                    # Stored as UTC like everything else since schema v6 — this used to
+                    # convert to local time, which made the column disagree with
+                    # `timestamp` and seeded a family of comparison bugs.
                     extracted_at = cleaned.get('extracted_at', '')
                     if extracted_at:
-                        # Parse UTC timestamp and convert to local timezone
                         try:
                             utc_dt = datetime.fromisoformat(extracted_at.replace('Z', '+00:00'))
-                            local_dt = utc_dt.astimezone()  # Convert to system timezone
-                            extracted_at = local_dt.strftime('%Y-%m-%d %H:%M:%S')
+                            extracted_at = utc_dt.strftime('%Y-%m-%d %H:%M:%S')
                         except ValueError:
                             # Fallback for unexpected formats
                             extracted_at = extracted_at.replace('T', ' ').replace('Z', '')
