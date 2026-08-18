@@ -11,9 +11,11 @@ ENV/
 # Screenshots
 screenshots/
 
-# Database
-database/*.db
-database/*.sqlite
+# Database — the WHOLE directory, no exceptions. Individual patterns kept missing
+# sidecars: a rollback journal made it into the public history in 2025 carrying real
+# location pages, and a WAL/SHM pair nearly repeated that in 2026. Nothing under
+# database/ ever belongs in git.
+database/
 
 # Logs
 logs/
@@ -40,6 +42,3 @@ dashboard/dist/
 # Debug output from the old screenshot/OCR pipeline
 temp_regions/
 dashboard/node_modules/
-# SQLite sidecar files — the -wal can hold un-checkpointed location rows
-database/*.db-wal
-database/*.db-shm
