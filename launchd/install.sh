@@ -12,7 +12,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
-LABELS=(com.airtrackr.api com.airtrackr.tracker)
+LABELS=(com.airtrackr.display com.airtrackr.api com.airtrackr.tracker)
 
 uninstall() {
     for label in "${LABELS[@]}"; do
@@ -77,6 +77,7 @@ if [ ! -x "$REPO/swift/airtag_extractor" ]; then
 fi
 
 mkdir -p "$AGENTS_DIR" "$REPO/logs"
+chmod +x "$REPO/launchd/prepare-session.sh"
 
 for label in "${LABELS[@]}"; do
     template="$REPO/launchd/$label.plist.template"
@@ -85,10 +86,30 @@ for label in "${LABELS[@]}"; do
     sed "s|@@REPO@@|$REPO|g" "$template" > "$target"
 
     # bootout first so a reinstall picks up the new plist rather than silently
-    # keeping the already-loaded one
+    # keeping the already-loaded one. bootout is not synchronous: bootstrapping straight
+    # after it fails with "Bootstrap failed: 5: Input/output error" while the old job is
+    # still going away, and under `set -e` that aborted the install half-finished,
+    # leaving some agents unloaded. So wait for it, then retry a few times.
     launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$target"
-    echo "  installed $label"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        launchctl list "$label" >/dev/null 2>&1 || break
+        sleep 0.5
+    done
+
+    bootstrapped=false
+    for attempt in 1 2 3 4 5; do
+        if launchctl bootstrap "gui/$(id -u)" "$target" 2>/dev/null; then
+            bootstrapped=true
+            break
+        fi
+        sleep 1
+    done
+    if [ "$bootstrapped" = true ]; then
+        echo "  installed $label"
+    else
+        echo "  ERROR: could not bootstrap $label" >&2
+        launchctl bootstrap "gui/$(id -u)" "$target"   # run once more, unmuted, to show why
+    fi
 done
 
 echo

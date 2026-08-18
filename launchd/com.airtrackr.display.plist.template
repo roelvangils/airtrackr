@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AirTrackr session setup: the virtual display, its resolution, and Find My.
+
+  Do not load this file directly — it contains @@REPO@@ placeholders.
+  Run ./launchd/install.sh, which fills them in and installs into
+  ~/Library/LaunchAgents.
+
+  Why this agent exists:
+  Find My is a Mac Catalyst app and will not build a window scene unless the GUI
+  session has a display to render on. With the lid shut and no monitor attached,
+  that display is DeskPad's virtual one — and DeskPad was not a login item, so
+  after a reboot nothing recreated it. The tracker then reads Find My as
+  "running but no accessible window" (exit 4) forever.
+
+  StartInterval re-runs the script every 5 minutes so the session repairs itself
+  if DeskPad or Find My disappears. The script is idempotent and cheap: it does
+  nothing when everything is already in place.
+
+  LimitLoadToSessionType Aqua for the same reason as the other agents: none of
+  this means anything outside a GUI login session.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.airtrackr.display</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@@REPO@@/launchd/prepare-session.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@@REPO@@</string>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>@@REPO@@/logs/display.log</string>
+    <key>StandardErrorPath</key>
+    <string>@@REPO@@/logs/display.log</string>
+</dict>
+</plist>
