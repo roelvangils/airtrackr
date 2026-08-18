@@ -25,10 +25,47 @@ uninstall() {
     echo "Uninstalled."
 }
 
+# --- Display prerequisite ------------------------------------------------------------
+#
+# The extractor reads the Find My app through the accessibility API, and that only works
+# while Find My has a window. A window needs a framebuffer, and a MacBook running headless
+# with the lid shut has none: IORegistry reports zero displays and no app can open a window
+# at all. Symptom, if this is missing: the extractor returns nothing, or the tracker falls
+# back to coarse shared coordinates that put several items on one identical position.
+#
+# DeskPad supplies a virtual display so a closed lid stops mattering; displayplacer keeps it
+# at a sane resolution, because DeskPad comes up at 3360x2100 which makes the machine
+# unusable over screen sharing.
+#
+# Both need one-off approval in System Settings after installation:
+#   - DeskPad: Screen Recording
+#   - the process running the extractor: Accessibility, and Full Disk Access if it reads
+#     the Photos or Find My caches
+ensure_display_tooling() {
+    if ! command -v brew >/dev/null 2>&1; then
+        echo "  ! Homebrew not found — install DeskPad and displayplacer manually"
+        return
+    fi
+
+    if [ ! -d "/Applications/DeskPad.app" ]; then
+        echo "  installing DeskPad (virtual display, needed with the lid closed)"
+        brew install --cask deskpad
+        echo "  ! Grant DeskPad Screen Recording in System Settings > Privacy & Security"
+    fi
+
+    if ! command -v displayplacer >/dev/null 2>&1; then
+        echo "  installing displayplacer (keeps the virtual display at a usable size)"
+        brew install displayplacer
+    fi
+}
+
 if [ "${1:-}" = "--uninstall" ]; then
     uninstall
     exit 0
 fi
+
+# Only on install: uninstalling must not pull in tooling.
+ensure_display_tooling
 
 if [ ! -x "$REPO/venv/bin/python" ]; then
     echo "Error: $REPO/venv is missing. Run ./setup.sh first." >&2

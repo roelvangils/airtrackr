@@ -28,8 +28,52 @@ AirTrackr solves this by reading Find My directly through macOS Accessibility AP
 - macOS (Ventura or later recommended)
 - Python 3.13+
 - Bun (for dashboard development)
-- Accessibility permissions granted to Terminal/IDE
-- Find My app open with devices visible
+- Accessibility permissions granted to whatever runs the extractor
+- Find My app running **with a window**
+
+### The display requirement (read this before installing on a headless Mac)
+
+AirTrackr reads the Find My app through the accessibility API, so Find My must have a
+window. A window needs a framebuffer, and a Mac running headless has none: a MacBook with
+the lid shut and no external display reports **zero displays** in IORegistry, and then *no*
+application can open a window at all — not Find My, and not a virtual-display app either.
+
+If this is missing there is no error. The extractor simply returns nothing, and anything
+downstream falls back to coarse positions — several distinct items reported at one
+identical coordinate, which looks like real data and is not.
+
+Any one of these satisfies it:
+
+| Option | Notes |
+|---|---|
+| Keep the lid open | Free, but easy to forget |
+| A dummy HDMI/USB-C plug | ~€10, survives reboots, nothing to configure |
+| **DeskPad** (virtual display) | Installed by `launchd/install.sh`; needs Screen Recording approval once |
+
+With DeskPad, also install `displayplacer`: DeskPad starts at 3360x2100, which makes the
+machine unusable over screen sharing. `launchd/install.sh` installs both, and the tracker
+resets the resolution to 1920x1080 on each run.
+
+Verify the requirement is met:
+
+```bash
+# Should be >= 1. Zero means no app can open a window.
+ioreg -c AppleDisplay -r | grep -c AppleDisplay
+
+# Should be 1.
+osascript -e 'tell application "System Events" to tell process "FindMy" to return count of windows'
+```
+
+### Permissions to grant once
+
+| Grant to | Where | Why |
+|---|---|---|
+| The extractor's parent process | Privacy & Security > **Accessibility** | Reading the Find My UI |
+| DeskPad | Privacy & Security > **Screen Recording** | Creating the virtual display |
+| Your shell or `bun`/`python` | Privacy & Security > **Full Disk Access** | Only if reading protected caches |
+
+Each shows a dialog on first use. Until it is approved the corresponding step fails
+silently rather than loudly — if extraction returns nothing, check these first.
 
 ## Quick Start
 
